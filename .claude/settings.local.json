@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import docx; print\\('python-docx available'\\)\")",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -m pip install python-docx)",
+      "Bash(apt list *)",
+      "Bash(sudo apt-get install -y python3-docx)",
+      "Bash(python3 -m pip install python-docx --break-system-packages)"
+    ]
+  }
+}
