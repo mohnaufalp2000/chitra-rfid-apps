@@ -11,13 +11,36 @@ class SnPhotoCapture {
   final String materialCode;
   final DateTime capturedAt;
 
+  /// Skor ketajaman saat foto diambil. Null untuk foto lama yang dimuat
+  /// dari penyimpanan.
+  final double? sharpness;
+
   const SnPhotoCapture({
     required this.path,
     required this.materialCode,
     required this.capturedAt,
+    this.sharpness,
   });
 }
 
+/// Dilempar saat foto terlalu blur. Foto tidak disimpan.
+class SnPhotoBlurException implements Exception {
+  final double sharpness;
+  final double threshold;
+
+  const SnPhotoBlurException({
+    required this.sharpness,
+    required this.threshold,
+  });
+
+  @override
+  String toString() =>
+      'Foto blur (ketajaman ${sharpness.toStringAsFixed(0)}, minimal ${threshold.toStringAsFixed(0)})';
+}
+
+/// Menyimpan foto SN per material.
+/// Foto disimpan FULL FRAME (tanpa crop). Nama class dan konstanta guide
+/// dipertahankan karena kotak hijau di kamera masih memakainya sebagai panduan.
 class SnPhotoCropService {
   SnPhotoCropService({DocumentsDirectory? documentsDirectory})
     : _documentsDirectory =
@@ -26,14 +49,27 @@ class SnPhotoCropService {
   static const double guideWidthFactor = .84;
   static const double guideAspectRatio = 3.2;
 
+  /// Batas minimal ketajaman. Di bawah angka ini foto dianggap blur.
+  /// Angka awal ini perkiraan; sesuaikan setelah melihat skor foto yang
+  /// tajam dan yang blur di status banner kamera.
+  static const double minSharpness = 60;
+
   final DocumentsDirectory _documentsDirectory;
 
   Future<SnPhotoCapture> cropAndSave({
     required String sourcePath,
     required String materialCode,
+    bool checkBlur = true,
   }) async {
     final sourceBytes = await File(sourcePath).readAsBytes();
-    final croppedBytes = await compute(_cropSnPhotoJpeg, sourceBytes);
+    final processed = await compute(_processSnPhotoJpeg, sourceBytes);
+
+    if (checkBlur && processed.sharpness < minSharpness) {
+      throw SnPhotoBlurException(
+        sharpness: processed.sharpness,
+        threshold: minSharpness,
+      );
+    }
 
     final capturedAt = DateTime.now();
     final directory = await _materialDirectory(materialCode);
@@ -41,12 +77,13 @@ class SnPhotoCropService {
     final output = File(
       '${directory.path}${Platform.pathSeparator}sn_${capturedAt.microsecondsSinceEpoch}.jpg',
     );
-    await output.writeAsBytes(croppedBytes, flush: true);
+    await output.writeAsBytes(processed.bytes, flush: true);
 
     return SnPhotoCapture(
       path: output.path,
       materialCode: materialCode,
       capturedAt: capturedAt,
+      sharpness: processed.sharpness,
     );
   }
 
@@ -94,32 +131,87 @@ class SnPhotoCropService {
   }
 }
 
-Uint8List _cropSnPhotoJpeg(Uint8List sourceBytes) {
+class _ProcessedSnPhoto {
+  final Uint8List bytes;
+  final double sharpness;
+
+  const _ProcessedSnPhoto({required this.bytes, required this.sharpness});
+}
+
+_ProcessedSnPhoto _processSnPhotoJpeg(Uint8List sourceBytes) {
   final decoded = image_lib.decodeImage(sourceBytes);
   if (decoded == null) throw Exception('Format foto tidak dapat diproses');
 
+  // Tetap diputar sesuai EXIF supaya foto tidak miring, tapi TIDAK di-crop.
   final oriented = image_lib.bakeOrientation(decoded);
-  final cropWidth = (oriented.width * SnPhotoCropService.guideWidthFactor)
+
+  // Ketajaman diukur hanya di area kotak hijau (tempat SN diarahkan),
+  // dan sebelum penyesuaian kontras supaya skornya tidak terdongkrak.
+  final regionWidth = (oriented.width * SnPhotoCropService.guideWidthFactor)
       .round();
-  final cropHeight = (cropWidth / SnPhotoCropService.guideAspectRatio)
+  final regionHeight = (regionWidth / SnPhotoCropService.guideAspectRatio)
       .round()
       .clamp(1, oriented.height);
-  final cropX = ((oriented.width - cropWidth) / 2).round();
-  final cropY = ((oriented.height - cropHeight) / 2).round();
-  final cropped = image_lib.copyCrop(
+  final region = image_lib.copyCrop(
     oriented,
-    x: cropX,
-    y: cropY,
-    width: cropWidth,
-    height: cropHeight,
+    x: ((oriented.width - regionWidth) / 2).round(),
+    y: ((oriented.height - regionHeight) / 2).round(),
+    width: regionWidth,
+    height: regionHeight,
   );
+  final measured = region.width > 640
+      ? image_lib.copyResize(
+          region,
+          width: 640,
+          interpolation: image_lib.Interpolation.average,
+        )
+      : region;
+  final sharpness = _laplacianVariance(measured);
 
   // Optimasi kontras & kecerahan untuk memperjelas ukiran teks pada ban hitam
   final enhanced = image_lib.adjustColor(
-    cropped,
+    oriented,
     contrast: 1.25,
     brightness: 1.05,
   );
 
-  return image_lib.encodeJpg(enhanced, quality: 92);
+  return _ProcessedSnPhoto(
+    bytes: image_lib.encodeJpg(enhanced, quality: 92),
+    sharpness: sharpness,
+  );
+}
+
+/// Variance of Laplacian pada luminance. Makin tinggi = makin tajam.
+double _laplacianVariance(image_lib.Image image) {
+  final w = image.width;
+  final h = image.height;
+  if (w < 3 || h < 3) return 0;
+
+  final lum = List<double>.filled(w * h, 0);
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      lum[y * w + x] = image.getPixel(x, y).luminance.toDouble();
+    }
+  }
+
+  var sum = 0.0;
+  var sumSq = 0.0;
+  var count = 0;
+  for (var y = 1; y < h - 1; y++) {
+    for (var x = 1; x < w - 1; x++) {
+      final center = lum[y * w + x];
+      final value =
+          4 * center -
+          lum[(y - 1) * w + x] -
+          lum[(y + 1) * w + x] -
+          lum[y * w + x - 1] -
+          lum[y * w + x + 1];
+      sum += value;
+      sumSq += value * value;
+      count++;
+    }
+  }
+
+  final mean = sum / count;
+  return sumSq / count - mean * mean;
 }

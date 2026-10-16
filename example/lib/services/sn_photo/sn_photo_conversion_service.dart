@@ -1,10 +1,7 @@
 import 'dart:convert';
 
-import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_crop_service.dart';
-
-enum SnPhotoConversionEngine { mlKit, vision }
 
 class SnPhotoTextResult {
   final SnPhotoCapture photo;
@@ -26,75 +23,18 @@ abstract interface class SnPhotoTextConverter {
   Future<List<SnPhotoTextResult>> convert(List<SnPhotoCapture> photos);
 }
 
-/// Selects the OCR implementation without coupling the register flow to it.
-///
-/// Vision batch is the default. ML Kit remains available as an explicit
-/// fallback with `--dart-define=SN_PHOTO_CONVERTER=mlkit`.
+/// Service utama untuk konversi foto serial number menggunakan Vision API.
+/// Bagian ML Kit sudah dihapus sepenuhnya.
 class SnPhotoConversionService implements SnPhotoTextConverter {
-  SnPhotoConversionService({
-    SnPhotoConversionEngine? engine,
-    SnPhotoTextConverter? mlKitConverter,
-    SnPhotoTextConverter? visionConverter,
-  }) : engine = engine ?? configuredEngine,
-       _mlKitConverter = mlKitConverter ?? MlKitSnPhotoConversionService(),
-       _visionConverter =
-           visionConverter ?? const VisionSnPhotoConversionService();
+  SnPhotoConversionService({SnPhotoTextConverter? visionConverter})
+    : _visionConverter =
+          visionConverter ?? const VisionSnPhotoConversionService();
 
-  static const _configuredEngineName = String.fromEnvironment(
-    'SN_PHOTO_CONVERTER',
-    defaultValue: 'vision',
-  );
-
-  static SnPhotoConversionEngine get configuredEngine =>
-      _configuredEngineName.toLowerCase() == 'mlkit'
-      ? SnPhotoConversionEngine.mlKit
-      : SnPhotoConversionEngine.vision;
-
-  final SnPhotoConversionEngine engine;
-  final SnPhotoTextConverter _mlKitConverter;
   final SnPhotoTextConverter _visionConverter;
 
   @override
   Future<List<SnPhotoTextResult>> convert(List<SnPhotoCapture> photos) {
-    return switch (engine) {
-      SnPhotoConversionEngine.mlKit => _mlKitConverter.convert(photos),
-      SnPhotoConversionEngine.vision => _visionConverter.convert(photos),
-    };
-  }
-}
-
-class MlKitSnPhotoConversionService implements SnPhotoTextConverter {
-  @override
-  Future<List<SnPhotoTextResult>> convert(List<SnPhotoCapture> photos) async {
-    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
-    final results = <SnPhotoTextResult>[];
-
-    try {
-      for (final photo in photos) {
-        try {
-          final inputImage = InputImage.fromFilePath(photo.path);
-          final recognized = await recognizer.processImage(inputImage);
-          final lines = recognized.blocks.expand(
-            (block) => block.lines.map((line) => line.text),
-          );
-          final serialNumber = SnSerialCandidateParser.extract(lines);
-
-          results.add(
-            SnPhotoTextResult(
-              photo: photo,
-              rawText: recognized.text,
-              serialNumber: serialNumber,
-            ),
-          );
-        } catch (error) {
-          results.add(SnPhotoTextResult(photo: photo, error: error.toString()));
-        }
-      }
-    } finally {
-      await recognizer.close();
-    }
-
-    return results;
+    return _visionConverter.convert(photos);
   }
 }
 
@@ -405,46 +345,5 @@ class VisionSnPhotoConversionService implements SnPhotoTextConverter {
     return separatorIndex < 0
         ? normalized
         : normalized.substring(separatorIndex + 1);
-  }
-}
-
-class SnSerialCandidateParser {
-  static final RegExp _preferredPattern = RegExp(r'^[A-Z]{2,4}[0-9]{6,12}$');
-  static final RegExp _allowedPattern = RegExp(r'^[A-Z0-9]{8,18}$');
-
-  static String? extract(Iterable<String> rawLines) {
-    final candidates = <({String value, int score})>[];
-
-    for (final rawLine in rawLines) {
-      final upper = rawLine.trim().toUpperCase();
-      if (upper.isEmpty || _looksLikeTireSize(upper)) continue;
-
-      final value = normalize(upper);
-      if (!_allowedPattern.hasMatch(value) || value.startsWith('DOT')) {
-        continue;
-      }
-
-      final letterCount = RegExp(r'[A-Z]').allMatches(value).length;
-      final digitCount = RegExp(r'[0-9]').allMatches(value).length;
-      if (letterCount < 2 || digitCount < 5) continue;
-
-      var score = value.length;
-      if (_preferredPattern.hasMatch(value)) score += 100;
-      if (value.length >= 10 && value.length <= 14) score += 20;
-      candidates.add((value: value, score: score));
-    }
-
-    if (candidates.isEmpty) return null;
-    candidates.sort((first, second) => second.score.compareTo(first.score));
-    return candidates.first.value;
-  }
-
-  static String normalize(String value) =>
-      value.trim().toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
-
-  static bool _looksLikeTireSize(String value) {
-    return RegExp(r'\d{2,3}[.,]\d').hasMatch(value) ||
-        value.contains('/') ||
-        value.contains(' R ');
   }
 }

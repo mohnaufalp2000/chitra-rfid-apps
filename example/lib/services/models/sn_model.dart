@@ -11,6 +11,10 @@ class SnModel {
   final TireCondition tireCondition;
   final String remarks;
 
+  /// Path foto SN (hasil konversi foto). Hanya untuk tampilan di aplikasi,
+  /// tidak ikut dikirim ke server (lihat toJson).
+  final String? photoPath;
+
   SnModel({
     required this.sn,
     this.material,
@@ -19,6 +23,7 @@ class SnModel {
     this.linked = false,
     this.tireCondition = TireCondition.good,
     this.remarks = '',
+    this.photoPath,
   });
 
   SnModel copyWith({
@@ -29,6 +34,7 @@ class SnModel {
     bool? linked,
     TireCondition? tireCondition,
     String? remarks,
+    String? photoPath,
   }) {
     return SnModel(
       sn: sn ?? this.sn,
@@ -38,6 +44,7 @@ class SnModel {
       linked: linked ?? this.linked,
       tireCondition: tireCondition ?? this.tireCondition,
       remarks: remarks ?? this.remarks,
+      photoPath: photoPath ?? this.photoPath,
     );
   }
 

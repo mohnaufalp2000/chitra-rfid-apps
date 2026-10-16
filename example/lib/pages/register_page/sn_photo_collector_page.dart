@@ -9,6 +9,8 @@ import 'package:flutter_uhf_rfid_example/providers.dart';
 import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_crop_service.dart';
 import 'package:flutter_uhf_rfid_example/styles/color.dart';
 
+import 'package:flutter/services.dart';
+
 class SnPhotoCollectorPage extends ConsumerStatefulWidget {
   final String materialCode;
 
@@ -21,7 +23,30 @@ class SnPhotoCollectorPage extends ConsumerStatefulWidget {
 
 class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+  // Tanpa jeda tunggu: kamera selalu autofokus kontinu di titik tengah
+  // (pre-focus), jadi saat gun ditekan fokus langsung dikunci dan foto
+  // langsung diambil.
+
   final SnPhotoCropService _photoService = SnPhotoCropService();
+
+  // Rantai pelepasan kamera yang dipakai bersama antar halaman. Saat halaman
+  // ditutup lalu dibuka lagi, kamera lama bisa masih dalam proses dilepas.
+  // Halaman baru menunggu rantai ini selesai sebelum membuka kamera.
+  static Future<void> _pendingRelease = Future<void>.value();
+
+  // Matikan torch dulu, baru dispose, lalu beri jeda agar hardware benar-benar
+  // bebas sebelum kamera dibuka lagi.
+  static Future<void> _releaseCamera(CameraController controller) async {
+    try {
+      if (controller.value.isInitialized) {
+        await controller.setFlashMode(FlashMode.off);
+      }
+    } catch (_) {}
+    try {
+      await controller.dispose();
+    } catch (_) {}
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
 
   // Animasi shutter flash — layar berkedip putih sekilas saat foto dijepret.
   late final AnimationController _shutterController;
@@ -36,11 +61,11 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
   int _cameraGeneration = 0;
   bool _isInitializing = true;
   bool _isLoadingPhotos = true;
+  bool _isFocusing = false;
   bool _isCapturing = false;
   bool _isTakingPicture = false;
   bool _isSavingQueue = false;
   bool _isTorchEnabled = false;
-  bool _isFocusLocked = false;
   double _currentZoom = 1.0;
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
@@ -49,6 +74,19 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
   String _statusMessage = 'Menyiapkan kamera...';
   String? _errorMessage;
 
+  // Indikator tap-to-focus: kotak kecil di titik yang disentuh.
+  Offset? _focusPoint;
+  Timer? _focusIndicatorTimer;
+
+  // Waktu tiap tahap (ms) untuk diagnosa kecepatan; tampil di status banner.
+  int _lastFocusMs = 0;
+  int _lastShotMs = 0;
+  int _lastTotalMs = 0;
+  final Stopwatch _gunWatch = Stopwatch();
+
+  // True jika kamera dilepas karena app masuk background (paused).
+  bool _releasedByLifecycle = false;
+  bool _lastShotBlurry = false;
   @override
   void initState() {
     super.initState();
@@ -127,22 +165,32 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
       _queuedShots + _pendingSourcePaths.length + (_isTakingPicture ? 1 : 0);
 
   bool get _hasPendingWork =>
+      _isFocusing ||
       _isCapturing ||
       _isTakingPicture ||
       _isSavingQueue ||
       _queuedShots > 0 ||
       _pendingSourcePaths.isNotEmpty;
 
+  // Kamera hanya dilepas saat app benar-benar masuk background (paused).
+  // `inactive` (tarik notifikasi, dialog izin, dll.) diabaikan: kamera tetap
+  // dipakai, jadi tidak ada dispose/buka ulang yang bikin crash atau loading.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.paused) {
-      _cameraGeneration++;
+    if (state == AppLifecycleState.paused) {
+      _releasedByLifecycle = true;
+      _cameraGeneration++; // batalkan inisialisasi yang sedang berjalan
       final controller = _cameraController;
       _cameraController = null;
-      if (controller != null) unawaited(controller.dispose());
-    } else if (state == AppLifecycleState.resumed &&
-        _cameraController == null) {
+      // Singkirkan CameraPreview dari layar SEBELUM controller di-dispose.
+      if (mounted) setState(() => _isInitializing = true);
+      if (controller != null) {
+        _pendingRelease = _pendingRelease.then(
+          (_) => _releaseCamera(controller),
+        );
+      }
+    } else if (state == AppLifecycleState.resumed && _releasedByLifecycle) {
+      _releasedByLifecycle = false;
       _initializeCamera();
     }
   }
@@ -153,6 +201,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
       setState(() {
         _isInitializing = true;
         _errorMessage = null;
+        _focusPoint = null;
         _statusMessage = 'Menyiapkan kamera...';
       });
     }
@@ -161,9 +210,14 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
       final previousController = _cameraController;
       _cameraController = null;
       if (previousController != null) {
-        await previousController.dispose();
-        await Future<void>.delayed(const Duration(milliseconds: 200));
+        _pendingRelease = _pendingRelease.then(
+          (_) => _releaseCamera(previousController),
+        );
       }
+      // Tunggu kamera dari sesi sebelumnya (halaman ini maupun halaman lama)
+      // benar-benar terlepas.
+      await _pendingRelease;
+      if (!mounted || generation != _cameraGeneration) return;
 
       if (_availableCameras.isEmpty) {
         _availableCameras = await availableCameras();
@@ -180,6 +234,8 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
         name: 'SnPhotoCollector',
       );
 
+      // Image stream tidak dipakai lagi, jadi format JPEG langsung dipakai
+      // supaya takePicture() tidak perlu konversi tambahan.
       final controller = CameraController(
         camera,
         ResolutionPreset.high,
@@ -187,40 +243,22 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
       await controller.initialize();
-      bool torchActive = false;
-      try {
-        await controller.setFlashMode(FlashMode.torch);
-        torchActive = true;
-      } catch (_) {
-        try {
-          await controller.setFlashMode(FlashMode.off);
-        } catch (_) {}
-      }
-      await controller.setFocusMode(
-        _isFocusLocked ? FocusMode.locked : FocusMode.auto,
-      );
 
       if (!mounted || generation != _cameraGeneration) {
         await controller.dispose();
         return;
       }
 
+      // Tampilkan preview SEKARANG. Torch, fokus, dan zoom disiapkan di
+      // latar belakang supaya layar tidak menunggu semuanya selesai.
       _cameraController = controller;
-      double minZ = 1.0;
-      double maxZ = 1.0;
-      try {
-        minZ = await controller.getMinZoomLevel();
-        maxZ = await controller.getMaxZoomLevel();
-      } catch (_) {}
-
       setState(() {
         _isInitializing = false;
-        _isTorchEnabled = torchActive;
-        _minZoom = minZ;
-        _maxZoom = maxZ;
         _currentZoom = 1.0;
-        _statusMessage = 'Arahkan satu SN ke kotak lalu tekan gun';
+        _statusMessage = 'Menyiapkan lampu dan fokus...';
       });
+
+      unawaited(_warmUpCamera(controller, generation));
     } on CameraException catch (error, stackTrace) {
       developer.log(
         'Camera initialization failed',
@@ -240,6 +278,59 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
       if (generation != _cameraGeneration) return;
       _showCameraError(error.toString().replaceFirst('Exception: ', ''));
     }
+  }
+
+  // Persiapan setelah preview tampil: torch, pre-focus ke tengah, dan batas zoom.
+  Future<void> _warmUpCamera(
+    CameraController controller,
+    int generation,
+  ) async {
+    // Baca batas zoom paralel dengan torch (tidak saling mengganggu).
+    final zoomFuture = () async {
+      try {
+        final minZ = await controller.getMinZoomLevel();
+        final maxZ = await controller.getMaxZoomLevel();
+        return (minZ, maxZ);
+      } catch (_) {
+        return (1.0, 1.0);
+      }
+    }();
+
+    final torchActive = await _applyTorch(controller);
+    await _prefocusCenter(controller);
+    final (minZ, maxZ) = await zoomFuture;
+
+    if (!mounted ||
+        generation != _cameraGeneration ||
+        _cameraController != controller) {
+      return;
+    }
+    setState(() {
+      _isTorchEnabled = torchActive;
+      _minZoom = minZ;
+      _maxZoom = maxZ;
+      _statusMessage = 'Arahkan SN ke kotak lalu tekan gun';
+    });
+  }
+
+  // Menyalakan torch dengan retry. Mengembalikan true jika berhasil.
+  Future<bool> _applyTorch(CameraController controller) async {
+    for (var attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await controller.setFlashMode(FlashMode.torch);
+        return true;
+      } catch (e) {
+        developer.log(
+          'Torch percobaan $attempt gagal: $e',
+          name: 'SnPhotoCollector',
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      }
+    }
+    try {
+      await controller.setFlashMode(FlashMode.off);
+    } catch (_) {}
+    return false;
   }
 
   void _showCameraError(String message) {
@@ -268,14 +359,26 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) return;
 
+    final pos = details.localPosition;
     final offset = Offset(
-      details.localPosition.dx / constraints.maxWidth,
-      details.localPosition.dy / constraints.maxHeight,
+      (pos.dx / constraints.maxWidth).clamp(0.0, 1.0),
+      (pos.dy / constraints.maxHeight).clamp(0.0, 1.0),
     );
+
+    // Tampilkan kotak kuning di titik tap selama 2 detik.
+    setState(() => _focusPoint = pos);
+    _focusIndicatorTimer?.cancel();
+    _focusIndicatorTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _focusPoint = null);
+    });
+
     try {
+      await controller.setFocusMode(FocusMode.auto);
       await controller.setFocusPoint(offset);
       await controller.setExposurePoint(offset);
-    } catch (_) {}
+    } catch (e) {
+      developer.log('Tap to focus error: $e', name: 'SnPhotoCollector');
+    }
   }
 
   Future<void> _toggleZoom() async {
@@ -289,33 +392,6 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
       await controller.setZoomLevel(target);
       if (mounted) setState(() => _currentZoom = target);
     } catch (_) {}
-  }
-
-  Future<void> _toggleFocusLock() async {
-    final controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) return;
-
-    final targetLocked = !_isFocusLocked;
-    try {
-      await controller.setFocusMode(
-        targetLocked ? FocusMode.locked : FocusMode.auto,
-      );
-      if (mounted) {
-        setState(() => _isFocusLocked = targetLocked);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            duration: const Duration(seconds: 2),
-            content: Text(
-              targetLocked
-                  ? '🔒 Fokus Terkunci: Jarak fokus tidak akan berubah/hunting saat diarahkan ke ban hitam.'
-                  : '🔓 Autofokus Otomatis Aktif.',
-            ),
-          ),
-        );
-      }
-    } catch (e) {
-      developer.log('Toggle focus lock error: $e', name: 'SnPhotoCollector');
-    }
   }
 
   Future<void> _showCameraSelectionDialog() async {
@@ -410,23 +486,83 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
       );
       if (mounted) {
         setState(() {
-          _errorMessage = 'Kamera belum siap';
-          _statusMessage = 'Tunggu kamera siap, lalu tekan gun lagi.';
+          _errorMessage = null;
+          _lastShotBlurry = false;
+          _statusMessage = 'Memfokus...';
         });
       }
       return;
     }
 
+    // Abaikan tekanan gun saat masih memfokus.
+    if (_isFocusing) return;
+
+    final sw = Stopwatch()..start();
+    _gunWatch
+      ..reset()
+      ..start();
+
+    _isFocusing = true;
     if (mounted) {
       setState(() {
-        _queuedShots++;
         _errorMessage = null;
-        _statusMessage = 'Mengambil foto...';
+        _statusMessage = 'Memfokus...';
       });
-    } else {
-      _queuedShots++;
     }
+
+    try {
+      await _focusAndLock(controller);
+    } finally {
+      _isFocusing = false;
+    }
+    _lastFocusMs = sw.elapsedMilliseconds;
+    developer.log(
+      'TIMING fokus selesai: ${sw.elapsedMilliseconds}ms',
+      name: 'SnPhotoCollector',
+    );
+
+    // Kamera bisa saja sudah diganti/ditutup selama proses fokus.
+    if (!mounted || _cameraController != controller) return;
+
+    setState(() {
+      _queuedShots++;
+      _statusMessage = 'Mengambil foto...';
+    });
     unawaited(_drainCaptureQueue());
+  }
+
+  // Arahkan autofokus kontinu ke tengah kotak hijau. Dipanggil saat kamera
+  // dibuka dan setiap selesai jepret, supaya lensa sudah fokus sebelum gun
+  // ditekan (pre-focus).
+  // [resetPoint] false = hanya kembalikan mode ke auto (titik fokus tetap
+  // tersimpan di kamera), jadi hanya 1 panggilan hardware, bukan 3.
+  Future<void> _prefocusCenter(
+    CameraController controller, {
+    bool resetPoint = true,
+  }) async {
+    const center = Offset(0.5, 0.5);
+    try {
+      await controller.setFocusMode(FocusMode.auto);
+      if (resetPoint) {
+        await controller.setFocusPoint(center);
+        await controller.setExposurePoint(center);
+      }
+    } catch (e) {
+      developer.log('Pre-focus error: $e', name: 'SnPhotoCollector');
+    }
+  }
+
+  // Saat gun ditekan: langsung KUNCI fokus di posisi sekarang (yang sudah
+  // fokus berkat pre-focus), tanpa menunggu. Dengan fokus terkunci,
+  // takePicture() tidak menjalankan autofokus/precapture sendiri.
+  Future<void> _focusAndLock(CameraController controller) async {
+    try {
+      await controller
+          .setFocusMode(FocusMode.locked)
+          .timeout(const Duration(milliseconds: 600));
+    } catch (e) {
+      developer.log('Lock focus error: $e', name: 'SnPhotoCollector');
+    }
   }
 
   Future<void> _drainCaptureQueue() async {
@@ -448,18 +584,31 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
           _statusMessage = 'Mengambil foto...';
         });
 
+        final tShot = Stopwatch()..start();
         final sourceImage = await controller.takePicture();
+        _lastShotMs = tShot.elapsedMilliseconds;
+        _lastTotalMs = _gunWatch.elapsedMilliseconds;
+        developer.log(
+          'TIMING takePicture: ${tShot.elapsedMilliseconds}ms',
+          name: 'SnPhotoCollector',
+        );
+
+        // Kembali ke autofokus kontinu di tengah (tanpa menunggu) supaya
+        // sudah fokus lagi untuk SN berikutnya.
+        unawaited(_prefocusCenter(controller, resetPoint: false));
         developer.log(
           'Photo captured: ${sourceImage.path}',
           name: 'SnPhotoCollector',
         );
 
         // Kilat shutter: layar memutih sekilas lalu memudar.
-        unawaited(
-          _shutterController
-              .forward(from: 0)
-              .then((_) => _shutterController.reverse()),
-        );
+        if (mounted) {
+          unawaited(
+            _shutterController.forward(from: 0).then((_) {
+              if (mounted) _shutterController.reverse();
+            }),
+          );
+        }
 
         _pendingSourcePaths.add(sourceImage.path);
         _isTakingPicture = false;
@@ -470,7 +619,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
           setState(() {
             _errorMessage = null;
             _statusMessage =
-                'Foto diambil. Arahkan ke SN berikutnya lalu tekan gun.';
+                'Foto diambil dalam ${(_lastTotalMs / 1000).toStringAsFixed(1)} detik. Arahkan ke SN berikutnya lalu tekan gun.';
           });
         }
       }
@@ -482,6 +631,9 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
         stackTrace: stackTrace,
       );
       _isTakingPicture = false;
+      try {
+        await controller.setFocusMode(FocusMode.auto);
+      } catch (_) {}
       if (!mounted) return;
       setState(() {
         _errorMessage = error.toString().replaceFirst('Exception: ', '');
@@ -502,7 +654,9 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
       while (_pendingSourcePaths.isNotEmpty) {
         final sourcePath = _pendingSourcePaths.first;
         var saved = false;
+        var rejectedAsBlurry = false;
         try {
+          final tSave = Stopwatch()..start();
           developer.log(
             'Cropping and saving: $sourcePath',
             name: 'SnPhotoCollector',
@@ -511,6 +665,10 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
             sourcePath: sourcePath,
             materialCode: widget.materialCode,
           );
+          developer.log(
+            'TIMING cropAndSave: ${tSave.elapsedMilliseconds}ms',
+            name: 'SnPhotoCollector',
+          );
           final savedFile = File(capture.path);
           final savedLength = await savedFile.length();
           if (savedLength == 0) {
@@ -518,7 +676,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
           }
           saved = true;
           developer.log(
-            'Photo saved: ${capture.path} ($savedLength bytes)',
+            'Photo saved: ${capture.path} ($savedLength bytes, ketajaman ${capture.sharpness?.toStringAsFixed(0)})',
             name: 'SnPhotoCollector',
           );
           if (mounted) {
@@ -529,11 +687,30 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
                 ..._captures.where((item) => item.path != capture.path),
               ];
               _errorMessage = null;
+              _lastShotBlurry = false;
               _statusMessage =
-                  '${_captures.length} foto tersimpan. Tekan gun untuk foto berikutnya.';
+                  '${_captures.length} foto tersimpan. Tekan gun untuk foto berikutnya.\n'
+                  'Ketajaman ${capture.sharpness?.toStringAsFixed(0) ?? '-'} • Fokus ${_lastFocusMs}ms • Jepret ${_lastShotMs}ms • Simpan ${tSave.elapsedMilliseconds}ms';
             });
           } else {
             _pendingSourcePaths.remove(sourcePath);
+          }
+        } on SnPhotoBlurException catch (error) {
+          // Foto blur: tidak disimpan, minta user mengambil ulang.
+          rejectedAsBlurry = true;
+          developer.log(
+            'Photo rejected as blurry: $error',
+            name: 'SnPhotoCollector',
+          );
+          _pendingSourcePaths.remove(sourcePath);
+          unawaited(HapticFeedback.heavyImpact());
+          if (mounted) {
+            setState(() {
+              _lastShotBlurry = true;
+              _errorMessage = '$error. Foto tidak disimpan.';
+              _statusMessage =
+                  'Foto BLUR. Ambil ulang: dekatkan, tahan stabil, lalu tekan gun lagi.';
+            });
           }
         } catch (error, stackTrace) {
           developer.log(
@@ -551,7 +728,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
             });
           }
         } finally {
-          if (saved) {
+          if (saved || rejectedAsBlurry) {
             try {
               final sourceFile = File(sourcePath);
               if (await sourceFile.exists()) await sourceFile.delete();
@@ -576,13 +753,35 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
     }
   }
 
-  Future<void> _deleteCapture(SnPhotoCapture capture) async {
-    await _photoService.deleteCapture(capture);
-    if (!mounted) return;
+  Future<bool> _deleteCapture(SnPhotoCapture capture) async {
+    if (_hasPendingWork) return false;
+
+    try {
+      await _photoService.deleteCapture(capture);
+    } catch (error, stackTrace) {
+      developer.log(
+        'Failed to delete photo: ${capture.path}',
+        name: 'SnPhotoCollector',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (!mounted) return false;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Gagal menghapus foto: ${error.toString().replaceFirst('Exception: ', '')}',
+          ),
+        ),
+      );
+      return false;
+    }
+
+    if (!mounted) return true;
     setState(() {
       _captures = _captures.where((item) => item.path != capture.path).toList();
       _statusMessage = '${_captures.length} foto tersimpan';
     });
+    return true;
   }
 
   Future<void> _confirmClearAll() async {
@@ -619,31 +818,89 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
   Future<void> _showPhoto(SnPhotoCapture capture) {
     return showDialog<void>(
       context: context,
-      builder: (dialogContext) => Dialog(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ClipRRect(
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(12),
-              ),
-              child: Image.file(File(capture.path), fit: BoxFit.contain),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(10),
-              child: Row(
-                children: [
-                  const Expanded(child: Text('Hasil crop foto SN')),
-                  IconButton(
-                    onPressed: () => Navigator.pop(dialogContext),
-                    icon: const Icon(Icons.close),
+      builder: (dialogContext) {
+        final textTheme = Theme.of(dialogContext).textTheme;
+
+        String two(int v) => v.toString().padLeft(2, '0');
+        final t = capture.capturedAt;
+        final waktu =
+            '${two(t.day)}/${two(t.month)}/${t.year}  ${two(t.hour)}:${two(t.minute)}:${two(t.second)}';
+
+        return Dialog.fullscreen(
+          backgroundColor: Colors.black,
+          child: SafeArea(
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Foto SN',
+                              style: textTheme.titleMedium?.copyWith(
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${widget.materialCode}  $waktu',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: textTheme.bodySmall?.copyWith(
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Tutup',
+                        onPressed: () => Navigator.pop(dialogContext),
+                        icon: const Icon(Icons.close, color: Colors.white),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+                Expanded(
+                  child: InteractiveViewer(
+                    minScale: 1,
+                    maxScale: 5,
+                    child: Center(
+                      child: Image.file(
+                        File(capture.path),
+                        fit: BoxFit.contain,
+                        errorBuilder: (_, _, _) => Text(
+                          'Foto tidak dapat dibuka',
+                          style: textTheme.bodyMedium?.copyWith(
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                  decoration: const BoxDecoration(
+                    border: Border(
+                      top: BorderSide(color: Colors.greenAccent, width: 2),
+                    ),
+                  ),
+                  child: Text(
+                    'Cubit untuk memperbesar dan memeriksa ketajaman tulisan SN.',
+                    style: textTheme.bodySmall?.copyWith(color: Colors.white70),
+                  ),
+                ),
+              ],
             ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 
@@ -674,7 +931,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
       appBar: AppBar(
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
-        title: const Text('Kumpulkan Foto SN'),
+        title: const Text(''),
         actions: [
           if (_captures.isNotEmpty)
             IconButton(
@@ -704,16 +961,6 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
                 ),
               ),
             ),
-          IconButton(
-            tooltip: _isFocusLocked ? 'Buka Kunci Fokus' : 'Kunci Fokus',
-            onPressed: controller?.value.isInitialized == true
-                ? _toggleFocusLock
-                : null,
-            icon: Icon(
-              _isFocusLocked ? Icons.lock : Icons.lock_open_outlined,
-              color: _isFocusLocked ? Colors.amberAccent : Colors.white,
-            ),
-          ),
           IconButton(
             tooltip: 'Lampu kamera',
             onPressed: controller?.value.isInitialized == true
@@ -755,15 +1002,42 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
-                        LayoutBuilder(
-                          builder: (context, constraints) {
-                            return GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onTapDown: (details) =>
-                                  _onTapToFocus(details, constraints),
-                              child: Center(child: CameraPreview(controller)),
-                            );
-                          },
+                        Center(
+                          child: CameraPreview(
+                            controller,
+                            child: LayoutBuilder(
+                              builder: (context, constraints) {
+                                return GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTapDown: (details) =>
+                                      _onTapToFocus(details, constraints),
+                                  child: Stack(
+                                    children: [
+                                      if (_focusPoint != null)
+                                        Positioned(
+                                          left: _focusPoint!.dx - 30,
+                                          top: _focusPoint!.dy - 30,
+                                          child: IgnorePointer(
+                                            child: Container(
+                                              width: 60,
+                                              height: 60,
+                                              decoration: BoxDecoration(
+                                                border: Border.all(
+                                                  color: Colors.amberAccent,
+                                                  width: 2,
+                                                ),
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
                         ),
                         _scanGuide(),
                         Positioned(
@@ -772,7 +1046,6 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
                           right: 12,
                           child: _cameraStatusBanner(),
                         ),
-                        // Overlay kilat putih saat foto dijepret.
                         IgnorePointer(
                           child: FadeTransition(
                             opacity: _shutterOpacity,
@@ -797,9 +1070,11 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
         : '';
     final detail =
         _errorMessage ??
-        (_pendingCount > 0
+        (_isFocusing
+            ? 'Mengarahkan fokus di tengah kotak hijau'
+            : _pendingCount > 0
             ? '$_pendingCount foto diproses • ${_captures.length} sudah tersimpan'
-            : 'Hanya area di dalam kotak hijau yang akan disimpan$activeCamInfo');
+            : 'Seluruh frame disimpan, kotak hijau hanya panduan$activeCamInfo');
 
     return IgnorePointer(
       child: Container(
@@ -855,6 +1130,12 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
   }
 
   Widget _scanGuide() {
+    final borderColor = _lastShotBlurry
+        ? Colors.redAccent
+        : _isFocusing
+        ? Colors.amberAccent
+        : Colors.greenAccent;
+
     return IgnorePointer(
       child: Center(
         child: FractionallySizedBox(
@@ -863,7 +1144,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
             aspectRatio: SnPhotoCropService.guideAspectRatio,
             child: Container(
               decoration: BoxDecoration(
-                border: Border.all(color: Colors.greenAccent, width: 3),
+                border: Border.all(color: borderColor, width: 3),
                 borderRadius: BorderRadius.circular(16),
                 color: Colors.black.withValues(alpha: .08),
               ),
@@ -904,8 +1185,25 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
                     ),
                   ),
                 ),
+                if (_captures.isNotEmpty)
+                  TextButton.icon(
+                    onPressed: _openAllPhotos,
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
+                    icon: const Icon(Icons.view_agenda_outlined, size: 16),
+                    label: const Text(
+                      'LIHAT SEMUA',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
                 if (_pendingCount > 0)
                   Container(
+                    margin: const EdgeInsets.only(left: 6),
                     padding: const EdgeInsets.symmetric(
                       horizontal: 8,
                       vertical: 4,
@@ -945,7 +1243,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
                       ),
                       label: Text(
                         _hasPendingWork ? 'SIMPAN' : 'SELESAI',
-                        style: const TextStyle(fontSize: 12),
+                        style: const TextStyle(fontSize: 11),
                       ),
                     ),
                   ),
@@ -959,13 +1257,183 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
     );
   }
 
+  Future<void> _openAllPhotos() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return FractionallySizedBox(
+              heightFactor: .95,
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 8, 8),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            'Semua Foto (${_captures.length})',
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.pop(sheetContext),
+                          icon: const Icon(Icons.close),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Expanded(
+                    child: _captures.isEmpty
+                        ? const Center(child: Text('Belum ada foto'))
+                        : ListView.separated(
+                            padding: const EdgeInsets.all(12),
+                            itemCount: _captures.length,
+                            separatorBuilder: (_, _) =>
+                                const SizedBox(height: 14),
+                            itemBuilder: (context, index) {
+                              final capture = _captures[index];
+
+                              return Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Stack(
+                                    children: [
+                                      ClipRRect(
+                                        borderRadius: BorderRadius.circular(12),
+                                        child: GestureDetector(
+                                          onTap: () => _showPhoto(capture),
+                                          child: Image.file(
+                                            File(capture.path),
+                                            width: double.infinity,
+                                            fit: BoxFit.fitWidth,
+                                            cacheWidth: 1080,
+                                            errorBuilder: (_, _, _) =>
+                                                Container(
+                                                  height: 200,
+                                                  width: double.infinity,
+                                                  color: Colors.grey.shade200,
+                                                  child: const Icon(
+                                                    Icons.broken_image_outlined,
+                                                    size: 40,
+                                                  ),
+                                                ),
+                                          ),
+                                        ),
+                                      ),
+                                      Positioned(
+                                        top: 8,
+                                        right: 8,
+                                        child: InkWell(
+                                          customBorder: const CircleBorder(),
+                                          onTap: _hasPendingWork
+                                              ? null
+                                              : () async {
+                                                  final deleted =
+                                                      await _confirmDeleteCapture(
+                                                        sheetContext,
+                                                        capture,
+                                                      );
+                                                  if (!deleted) return;
+                                                  if (!sheetContext.mounted) {
+                                                    return;
+                                                  }
+                                                  setSheetState(() {});
+                                                  if (_captures.isEmpty) {
+                                                    Navigator.pop(sheetContext);
+                                                  }
+                                                },
+                                          child: Container(
+                                            padding: const EdgeInsets.all(8),
+                                            decoration: BoxDecoration(
+                                              color: _hasPendingWork
+                                                  ? Colors.black26
+                                                  : Colors.black54,
+                                              shape: BoxShape.circle,
+                                            ),
+                                            child: const Icon(
+                                              Icons.delete_outline,
+                                              color: Colors.white,
+                                              size: 22,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Foto ${index + 1} dari ${_captures.length}',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Colors.grey.shade600,
+                                    ),
+                                  ),
+                                ],
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<bool> _confirmDeleteCapture(
+    BuildContext dialogContext,
+    SnPhotoCapture capture,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: dialogContext,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.delete_outline, color: Colors.red, size: 40),
+        title: const Text('Hapus foto?'),
+        content: const Text(
+          'Foto akan dihapus dari perangkat dan tidak bisa dikembalikan.',
+          textAlign: TextAlign.center,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('BATAL'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('HAPUS'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return false;
+    return _deleteCapture(capture);
+  }
+
   Widget _photoStrip() {
     final itemCount = _pendingSourcePaths.length + _captures.length;
     if (itemCount == 0) {
       return Align(
         alignment: Alignment.centerLeft,
         child: Text(
-          _isTakingPicture || _queuedShots > 0
+          _isFocusing
+              ? 'Memfokus...'
+              : _isTakingPicture || _queuedShots > 0
               ? 'Sedang mengambil foto...'
               : 'Tekan gun untuk mengambil foto SN',
           style: TextStyle(color: Colors.grey.shade600, fontSize: 11),
@@ -1093,11 +1561,17 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _focusIndicatorTimer?.cancel();
     _shutterController.dispose();
     _cameraGeneration++;
     _triggerCoordinator.mode = PhysicalTriggerMode.rfid;
     _triggerSubscription?.cancel();
-    _cameraController?.dispose();
+
+    final controller = _cameraController;
+    _cameraController = null;
+    if (controller != null) {
+      _pendingRelease = _pendingRelease.then((_) => _releaseCamera(controller));
+    }
     super.dispose();
   }
 }

@@ -91,7 +91,11 @@ class _RegisterPageState extends ConsumerState<RegisterPage> {
     final serialManager = ref.read(uhfReaderProvider);
 
     try {
-      await serialManager.connect(devicePath: '/dev/ttyHSL0', baudRate: 115200);
+      await serialManager.connectLowPower(
+        devicePath: '/dev/ttyHSL0',
+        baudRate: 115200,
+        powerDbm: ref.read(rfidSettingsProvider).powerDbm,
+      );
 
       debugPrint('RFID auto connected');
     } catch (e) {

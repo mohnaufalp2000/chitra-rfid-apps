@@ -7,6 +7,7 @@ import 'package:flutter_uhf_rfid_example/styles/font.dart';
 import 'package:flutter_uhf_rfid_example/widgets/home_header.dart';
 import 'package:flutter_uhf_rfid_example/widgets/info_card.dart';
 import 'package:flutter_uhf_rfid_example/widgets/menu_card.dart';
+import 'package:flutter_uhf_rfid_example/widgets/reader_settings_card.dart';
 
 class HomePage extends StatelessWidget {
   const HomePage({super.key});
@@ -46,6 +47,18 @@ class HomePage extends StatelessWidget {
                       'Pilih proses sesuai pergerakan ban yang sedang dikerjakan.',
                       style: AppFont.style(size: 14, color: AppColor.textGrey),
                     ),
+
+                    const SizedBox(height: 24),
+
+                    _sectionTitle(
+                      icon: Icons.tune_rounded,
+                      title: 'Daya Pancar Reader',
+                      subtitle: 'Atur jarak baca RFID di perangkat ini.',
+                    ),
+
+                    const SizedBox(height: 12),
+
+                    const ReaderSettingsCard(),
 
                     const SizedBox(height: 24),
 

@@ -54,8 +54,6 @@ app.*.map.json
 .buildlog/
 .history
 
-
-
 # Flutter repo-specific
 /bin/cache/
 /bin/internal/bootstrap.bat
@@ -165,3 +163,6 @@ app.*.symbols
 !/packages/flutter_tools/test/data/dart_dependencies_test/**/.packages
 !/dev/ci/**/Gemfile.lock
 >>>>>>> fe896309f8bc03bac7c2eadf16fbf70bd1b246a4
+
+# FVM Version Cache
+.fvm/

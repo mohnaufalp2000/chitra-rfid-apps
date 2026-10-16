@@ -17,6 +17,11 @@ class ListSnPage extends ConsumerStatefulWidget {
 }
 
 class _ListSnPageState extends ConsumerState<ListSnPage> {
+  // Disimpan saat widget masih aktif, supaya aman dipanggil di dispose()
+  // tanpa memakai `ref`. Memakai closure agar tidak perlu menulis nama tipe
+  // notifier-nya.
+  late final Future<void> Function() _stopScanning;
+
   bool _isConnecting = false;
   bool _isProcessingTags = false;
   bool _isTimedScanActive = false;
@@ -33,7 +38,13 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
   void initState() {
     super.initState();
 
+    final scanNotifier = ref.read(isScanningProvider.notifier);
+    _stopScanning = () async {
+      await scanNotifier.stop();
+    };
+
     Future.microtask(() async {
+      if (!mounted) return;
       ref.read(scannedTagsProvider);
       ref.read(triggerHandlerProvider);
       await _autoConnectRfid();
@@ -42,7 +53,17 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
 
   @override
   void dispose() {
-    ref.read(isScanningProvider.notifier).stop();
+    // Jangan pakai `ref` di sini. Ditunda dengan microtask agar tidak
+    // memodifikasi provider saat widget tree sedang di-teardown.
+    final stopScanning = _stopScanning;
+    Future.microtask(() async {
+      try {
+        await stopScanning();
+      } catch (_) {
+        // Provider mungkin sudah ter-dispose, abaikan.
+      }
+    });
+
     _referenceController.dispose();
     _customerController.dispose();
     _destinationController.dispose();
@@ -191,25 +212,32 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
       return;
     }
 
+    // Ambil semua yang dibutuhkan SEBELUM await.
+    final listSnNotifier = ref.read(listSnProvider.notifier);
+    final tagsNotifier = ref.read(scannedTagsProvider.notifier);
+    final messenger = ScaffoldMessenger.of(context);
+
     try {
-      await ref.read(listSnProvider.notifier).saveOutgoingRfid();
-      ref.read(scannedTagsProvider.notifier).clearTags();
+      await listSnNotifier.saveOutgoingRfid();
+      tagsNotifier.clearTags();
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
+      messenger.showSnackBar(
         const SnackBar(content: Text('Ban keluar berhasil disimpan.')),
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
+      messenger.showSnackBar(
         SnackBar(
           content: Text(
             'Gagal menyimpan: ${e.toString().replaceFirst('Exception: ', '')}',
           ),
           action: SnackBarAction(
             label: 'COBA LAGI',
-            onPressed: () =>
-                _confirmSaveOutgoing(ref.read(listSnProvider).items),
+            onPressed: () {
+              if (!mounted) return;
+              _confirmSaveOutgoing(ref.read(listSnProvider).items);
+            },
           ),
         ),
       );
@@ -671,7 +699,10 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
   }
 
   Future<void> _autoConnectRfid() async {
+    if (!mounted) return;
+
     final reader = ref.read(uhfReaderProvider);
+    final listSnNotifier = ref.read(listSnProvider.notifier);
 
     if (reader.isConnected || _isConnecting) {
       return;
@@ -680,9 +711,10 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
     setState(() => _isConnecting = true);
 
     try {
-      final connected = await reader.connect(
+      final connected = await reader.connectLowPower(
         devicePath: '/dev/ttyHSL0',
         baudRate: 115200,
+        powerDbm: ref.read(rfidSettingsProvider).powerDbm,
       );
 
       if (!connected) {
@@ -693,7 +725,7 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
 
       final message =
           'Gagal menghubungkan RFID reader: ${error.toString().replaceFirst('Exception: ', '')}';
-      ref.read(listSnProvider.notifier).setRetryableError(message);
+      listSnNotifier.setRetryableError(message);
 
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
@@ -1109,7 +1141,10 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
       return;
     }
 
+    // Ambil semua notifier SEBELUM await pertama.
     final scanNotifier = ref.read(isScanningProvider.notifier);
+    final tagsNotifier = ref.read(scannedTagsProvider.notifier);
+    final listSnNotifier = ref.read(listSnProvider.notifier);
     final scanMode = ref.read(scanModeProvider);
     final isScanning = ref.read(isScanningProvider);
 
@@ -1124,7 +1159,7 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
 
     try {
       // Bersihkan hasil scan sebelumnya
-      ref.read(scannedTagsProvider.notifier).clearTags();
+      tagsNotifier.clearTags();
 
       // Mulai scan
       await scanNotifier.start();
@@ -1134,7 +1169,7 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
       }
 
       for (var attempt = 0; attempt < 50; attempt++) {
-        if (!ref.read(isScanningProvider)) {
+        if (!mounted || !ref.read(isScanningProvider)) {
           return;
         }
         await Future.delayed(const Duration(milliseconds: 100));
@@ -1142,6 +1177,7 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
 
       // Biasanya Single berhenti pada tag pertama. Timeout ini memastikan
       // reader tidak terus memindai jika tidak ada tag yang terbaca.
+      if (!mounted) return;
       await scanNotifier.stop();
     } catch (e) {
       try {
@@ -1152,7 +1188,7 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
 
       final message =
           'Gagal scan RFID: ${e.toString().replaceFirst('Exception: ', '')}';
-      ref.read(listSnProvider.notifier).setRetryableError(message);
+      listSnNotifier.setRetryableError(message);
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(message), backgroundColor: Colors.red),
@@ -1174,14 +1210,14 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
     try {
       final notifier = ref.read(listSnProvider.notifier);
       final previousState = ref.read(listSnProvider);
+      final reader = ref.read(uhfReaderProvider);
       notifier.clearError();
 
-      final reader = ref.read(uhfReaderProvider);
       if (!reader.isConnected) {
         await _autoConnectRfid();
       }
 
-      if (!reader.isConnected) {
+      if (!mounted || !reader.isConnected) {
         return;
       }
 
@@ -1233,6 +1269,7 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
       final itemCountBefore = ref.read(listSnProvider).items.length;
 
       for (final epc in epcs) {
+        if (!mounted) return;
         debugPrint('RFID EPC : $epc');
         await notifier.scanByEpc(epc);
       }

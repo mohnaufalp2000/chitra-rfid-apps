@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_uhf_rfid_example/pages/register_page/register_provider.dart';
 import 'package:flutter_uhf_rfid_example/pages/register_page/sn_photo_collector_page.dart';
+import 'package:flutter_uhf_rfid_example/pages/register_page/sn_quick_scan_page.dart';
 import 'package:flutter_uhf_rfid_example/styles/color.dart';
 import 'package:flutter_uhf_rfid_example/styles/font.dart';
 
@@ -42,7 +43,7 @@ class SnInputCard extends ConsumerWidget {
                     onSubmitted: (_) => notifier.addSn(),
                     decoration: InputDecoration(
                       hintText: hasMaterial
-                          ? 'Ketik Serial Number (SN)'
+                          ? 'Ketik SN'
                           : 'Pilih material terlebih dahulu',
                       hintStyle: AppFont.style(color: Colors.grey.shade500),
                       contentPadding: const EdgeInsets.symmetric(
@@ -115,6 +116,40 @@ class SnInputCard extends ConsumerWidget {
                   side: BorderSide(
                     color: AppColor.primary.withValues(alpha: .4),
                   ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: FilledButton.icon(
+                onPressed: hasMaterial
+                    ? () => Navigator.push<bool>(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => SnQuickScanPage(
+                            materialCode:
+                                selectedMaterial.material ?? 'unknown',
+                          ),
+                        ),
+                      )
+                    : null,
+                icon: const Icon(Icons.document_scanner),
+                label: Text(
+                  'QUICK SCAN',
+                  style: AppFont.style(
+                    weight: FontWeight.w600,
+                    size: 12,
+                    color: Colors.white,
+                  ),
+                ),
+                style: FilledButton.styleFrom(
+                  backgroundColor: AppColor.primary,
+                  foregroundColor: Colors.white,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),

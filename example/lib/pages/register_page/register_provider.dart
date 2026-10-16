@@ -150,9 +150,18 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
     if (addSnBatch([sn]) > 0) snController.clear();
   }
 
-  /// Adds multiple OCR results at once while preserving material association
-  /// and ignoring empty or duplicate serial numbers.
+  /// Versi sederhana tanpa foto. Dipertahankan agar kode/tes lama tetap jalan.
   int addSnBatch(Iterable<String> serialNumbers, {MaterialModel? material}) {
+    return addSnDrafts(
+      serialNumbers.map((sn) => SnDraft(sn)),
+      material: material,
+    );
+  }
+
+  /// Menambah banyak SN sekaligus (mis. hasil OCR) lengkap dengan path foto.
+  /// SN kosong atau duplikat diabaikan. SN baru ditaruh di ATAS daftar;
+  /// urutan di dalam satu batch tetap sesuai urutan foto.
+  int addSnDrafts(Iterable<SnDraft> drafts, {MaterialModel? material}) {
     final selectedMaterial = material ?? state.selectedMaterial;
     if (selectedMaterial == null) return 0;
 
@@ -161,15 +170,18 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         .toSet();
     final additions = <SnModel>[];
 
-    for (final value in serialNumbers) {
-      final sn = value.trim();
+    for (final draft in drafts) {
+      final sn = draft.sn.trim();
       if (sn.isEmpty || !existing.add(sn.toUpperCase())) continue;
-      additions.add(SnModel(sn: sn, material: selectedMaterial));
+      additions.add(
+        SnModel(sn: sn, material: selectedMaterial, photoPath: draft.photoPath),
+      );
     }
 
     if (additions.isEmpty) return 0;
 
-    final updatedList = [...state.snList, ...additions];
+    // Terbaru di atas. Auto-pilih SN berikutnya juga mengikuti urutan ini.
+    final updatedList = [...additions, ...state.snList];
     state = state.copyWith(
       snList: updatedList,
       selectedSn: state.selectedSn ?? _firstUnlinkedSn(updatedList),
@@ -177,7 +189,64 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
     return additions.length;
   }
 
-  Future<SnPhotoConversionResult> convertSnPhotosToText() async {
+  /// Memuat foto SN tersimpan untuk material yang sedang dipilih.
+  /// Dipakai UI untuk menampilkan dialog rotasi sebelum konversi.
+  Future<List<SnPhotoCapture>> loadSnPhotosForSelectedMaterial() async {
+    final materialCode = state.selectedMaterial?.material?.trim() ?? '';
+    if (materialCode.isEmpty) {
+      throw Exception('Pilih material sebelum mengonversi foto SN');
+    }
+    return _loadSnPhotos(materialCode);
+  }
+
+  /// Ubah nilai SN. Mengembalikan false bila kosong atau sudah dipakai SN lain.
+  /// EPC/RSSI/status linked tetap dipertahankan (hanya field `sn` yang diganti).
+  bool editSn(String oldSn, String newSn) {
+    final value = newSn.trim();
+    if (value.isEmpty) return false;
+    if (value == oldSn) return true;
+
+    final duplicate = state.snList.any(
+      (item) =>
+          item.sn != oldSn &&
+          item.sn.trim().toUpperCase() == value.toUpperCase(),
+    );
+    if (duplicate) return false;
+
+    state = state.copyWith(
+      snList: state.snList
+          .map((item) => item.sn == oldSn ? item.copyWith(sn: value) : item)
+          .toList(),
+      selectedSn: state.selectedSn == oldSn ? value : state.selectedSn,
+    );
+    return true;
+  }
+
+  /// Lepas RFID dari SN sebelum disimpan. SN kembali berstatus belum
+  /// terhubung dan langsung dipilih supaya bisa ditembak ulang.
+  void unlinkRfid(String sn) {
+    state = state.copyWith(
+      snList: state.snList.map((item) {
+        if (item.sn != sn) return item;
+
+        // copyWith tidak bisa mengosongkan epc/rssi, jadi buat objek baru.
+        return SnModel(
+          sn: item.sn,
+          material: item.material,
+          tireCondition: item.tireCondition,
+          remarks: item.remarks,
+          photoPath: item.photoPath,
+        );
+      }).toList(),
+      selectedSn: sn,
+    );
+  }
+
+  /// Jika [photos] diisi, foto tersebut yang dikirim ke OCR (misalnya setelah
+  /// dirotasi). Jika kosong, foto dimuat ulang dari penyimpanan.
+  Future<SnPhotoConversionResult> convertSnPhotosToText({
+    List<SnPhotoCapture>? photos,
+  }) async {
     if (state.isConvertingSnPhotos) {
       throw Exception('Konversi foto SN masih berjalan');
     }
@@ -194,8 +263,8 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
     state = state.copyWith(isConvertingSnPhotos: true, error: null);
 
     try {
-      final photos = await _loadSnPhotos(materialCode);
-      if (photos.isEmpty) {
+      final loadedPhotos = photos ?? await _loadSnPhotos(materialCode);
+      if (loadedPhotos.isEmpty) {
         return SnPhotoConversionResult(
           material: material,
           materialCode: materialCode,
@@ -203,7 +272,7 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         );
       }
 
-      final photoResults = await _convertSnPhotos(photos);
+      final photoResults = await _convertSnPhotos(loadedPhotos);
 
       return SnPhotoConversionResult(
         material: material,
@@ -404,6 +473,14 @@ class RegisterState {
       selectedSn: clearSelectedSn ? null : selectedSn ?? this.selectedSn,
     );
   }
+}
+
+/// Satu SN calon tambah, opsional dengan foto sumbernya.
+class SnDraft {
+  final String sn;
+  final String? photoPath;
+
+  const SnDraft(this.sn, {this.photoPath});
 }
 
 class SnPhotoConversionResult {

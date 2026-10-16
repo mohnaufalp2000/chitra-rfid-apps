@@ -2,6 +2,32 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:flutter_uhf_rfid/flutter_uhf_rfid.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+/// Nilai bawaan daya pancar reader dalam dBm. Makin kecil, makin dekat jarak
+/// bacanya. Nilai yang dipakai sebenarnya diatur dari halaman Home
+/// (lihat [rfidSettingsProvider]).
+const int kRfidPowerDbm = 2;
+
+/// Rentang daya yang bisa dipilih di UI.
+/// Catatan: batas 0..30 adalah perkiraan umum modul UHF. Sesuaikan dengan
+/// rentang yang diterima `setGain` di plugin.
+const int kRfidPowerMinDbm = 1;
+const int kRfidPowerMaxDbm = 30;
+
+extension UhfReaderLowPower on UhfReader {
+  /// Connect, lalu langsung turunkan daya pancar. Daya harus diatur ulang
+  /// setiap kali connect karena disconnect mematikan modul.
+  Future<bool> connectLowPower({
+    String devicePath = '/dev/ttyHSL0',
+    int baudRate = 115200,
+    int powerDbm = kRfidPowerDbm,
+  }) async {
+    final ok = await connect(devicePath: devicePath, baudRate: baudRate);
+    if (ok) await setGain(powerDbm);
+    return ok;
+  }
+}
 
 /// How a scan behaves once started.
 enum ScanMode {
@@ -35,6 +61,74 @@ final statusMessageProvider = StreamProvider<String>((ref) {
   final reader = ref.watch(uhfReaderProvider);
   return reader.statusStream;
 });
+
+/// Pengaturan reader yang bisa diubah pengguna dan disimpan di perangkat.
+class RfidSettings {
+  /// Daya pancar dalam dBm. Makin kecil, makin dekat jarak bacanya.
+  final int powerDbm;
+
+  const RfidSettings({this.powerDbm = kRfidPowerDbm});
+
+  RfidSettings copyWith({int? powerDbm}) =>
+      RfidSettings(powerDbm: powerDbm ?? this.powerDbm);
+}
+
+class RfidSettingsNotifier extends StateNotifier<RfidSettings> {
+  RfidSettingsNotifier() : super(const RfidSettings()) {
+    _load();
+  }
+
+  static const _powerKey = 'rfid_power_dbm';
+
+  /// Mencegah hasil load menimpa nilai yang sudah diubah pengguna.
+  bool _touched = false;
+
+  Future<void> _load() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_touched || !mounted) return;
+      state = RfidSettings(
+        powerDbm: _clampPower(prefs.getInt(_powerKey) ?? kRfidPowerDbm),
+      );
+    } catch (_) {
+      // Gagal membaca penyimpanan: tetap pakai nilai bawaan.
+    }
+  }
+
+  int _clampPower(int v) => v.clamp(kRfidPowerMinDbm, kRfidPowerMaxDbm).toInt();
+
+  /// Dipanggil terus saat slider digeser. Belum disimpan ke penyimpanan.
+  void setPower(int value) {
+    _touched = true;
+    state = state.copyWith(powerDbm: _clampPower(value));
+  }
+
+  /// Simpan ke penyimpanan. Dipanggil saat slider dilepas.
+  Future<void> commit() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_powerKey, state.powerDbm);
+    } catch (_) {
+      // Nilai tetap berlaku selama aplikasi berjalan.
+    }
+  }
+
+  Future<void> reset() {
+    _touched = true;
+    state = const RfidSettings();
+    return commit();
+  }
+}
+
+final rfidSettingsProvider =
+    StateNotifierProvider<RfidSettingsNotifier, RfidSettings>(
+      (ref) => RfidSettingsNotifier(),
+    );
+
+/// Tag dengan RSSI lebih lemah dari nilai ini dianggap terlalu jauh dan
+/// diabaikan. Kalibrasi di perangkat asli: lihat RSSI tag yang dekat dan
+/// tag tetangga, lalu pilih nilai di antara keduanya.
+final minRssiProvider = StateProvider<int>((ref) => -40);
 
 final batteryStatusProvider = StateProvider<int?>((ref) => null);
 final gainSettingProvider = StateProvider<int?>((ref) => null);
@@ -100,6 +194,10 @@ class ScannedTagsNotifier extends StateNotifier<List<RFIDTag>> {
   }
 
   void _onTag(RFIDTag tag) {
+    // Abaikan tag yang terlalu jauh: tidak dicatat, tidak membunyikan buzzer,
+    // dan tidak menghentikan scan mode Single.
+    if (tag.rssi < ref.read(minRssiProvider)) return;
+
     final singleMode = ref.read(scanModeProvider) == ScanMode.single;
     final scanning = ref.read(isScanningProvider);
     final isNewEpc = _seenEpcs.add(tag.epcHex); // false if EPC already seen

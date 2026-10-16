@@ -1,10 +1,16 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_uhf_rfid_example/pages/register_page/register_provider.dart';
 import 'package:flutter_uhf_rfid_example/providers.dart';
 import 'package:flutter_uhf_rfid_example/services/models/sn_model.dart';
+// Import di bawah dipakai untuk tipe SnPhotoCapture. Hapus yang tidak perlu
+// (sesuai file tempat SnPhotoCapture didefinisikan) kalau muncul warning unused.
+import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_conversion_service.dart';
+import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_crop_service.dart';
+import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_rotation_service.dart';
 import 'package:flutter_uhf_rfid_example/styles/color.dart';
 import 'package:flutter_uhf_rfid_example/styles/font.dart';
 
@@ -96,6 +102,12 @@ class SnListCard extends ConsumerWidget {
 
         switch (result.status) {
           case RfidLinkStatus.linked:
+            try {
+              ref.read(uhfReaderProvider).beep();
+            } catch (_) {}
+            SystemSound.play(SystemSoundType.click);
+            HapticFeedback.lightImpact();
+
             final nextSn = ref.read(registerProvider).selectedSn;
             _showMessage(
               context,
@@ -228,7 +240,7 @@ class SnListCard extends ConsumerWidget {
               child: Text(
                 state.selectedMaterial == null
                     ? 'Pilih material terlebih dahulu untuk membaca foto SN.'
-                    : 'Semua foto material ${state.selectedMaterial?.material ?? '-'} dikirim sekali ke Vision API. Periksa hasil sebelum ditambahkan.',
+                    : 'Foto material ${state.selectedMaterial?.material ?? '-'} bisa diputar dulu, lalu dikirim sekali ke Vision API. Periksa hasil sebelum ditambahkan.',
                 style: AppFont.style(size: 11, color: Colors.grey.shade600),
               ),
             ),
@@ -340,10 +352,19 @@ class SnListCard extends ConsumerWidget {
               final selected = state.selectedSn == item.sn;
 
               return Padding(
+                key: ValueKey('sn-${item.sn}'),
                 padding: const EdgeInsets.only(bottom: 12),
 
                 child: _snExpansion(
                   sn: item.sn,
+                  photoPath: item.photoPath,
+                  onPhotoTap: item.photoPath == null
+                      ? null
+                      : () => _showSnPhotoPreview(
+                          context,
+                          path: item.photoPath!,
+                          sn: item.sn,
+                        ),
                   epc: item.epc ?? '',
                   rssi: item.rssi ?? '',
                   linked: item.linked,
@@ -369,6 +390,20 @@ class SnListCard extends ConsumerWidget {
                   onRemarksChanged: (remarks) {
                     notifier.updateRemarks(item.sn, remarks);
                   },
+
+                  // Dinonaktifkan saat EPC sedang dicek ke database supaya
+                  // SN tidak berubah di tengah proses link.
+                  onEdit: state.isCheckingEpc
+                      ? null
+                      : () => _editSn(context, ref, item.sn),
+                  onUnlinkRfid: state.isCheckingEpc || !item.linked
+                      ? null
+                      : () => _confirmUnlinkRfid(
+                          context,
+                          ref,
+                          sn: item.sn,
+                          epc: item.epc ?? '',
+                        ),
                 ),
               );
             }),
@@ -378,14 +413,116 @@ class SnListCard extends ConsumerWidget {
     );
   }
 
+  // ============================================================
+  // EDIT SN
+  // ============================================================
+  Future<void> _editSn(
+    BuildContext context,
+    WidgetRef ref,
+    String currentSn,
+  ) async {
+    final input = await showDialog<String>(
+      context: context,
+      builder: (_) => _EditSnDialog(initialSn: currentSn),
+    );
+    if (input == null || !context.mounted) return;
+
+    final newSn = input.trim().toUpperCase();
+    if (newSn == currentSn) return;
+
+    final ok = ref.read(registerProvider.notifier).editSn(currentSn, newSn);
+    _showMessage(
+      context,
+      ok
+          ? 'SN diubah menjadi $newSn.'
+          : 'SN tidak boleh kosong atau sudah dipakai SN lain.',
+      ok ? Colors.green : Colors.red,
+    );
+  }
+
+  // ============================================================
+  // HAPUS RFID DARI SN (agar bisa ditembak ulang)
+  // ============================================================
+  Future<void> _confirmUnlinkRfid(
+    BuildContext context,
+    WidgetRef ref, {
+    required String sn,
+    required String epc,
+  }) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => _UnlinkRfidDialog(sn: sn, epc: epc),
+    );
+    if (confirmed != true || !context.mounted) return;
+
+    // Hentikan scan dulu. Kalau mode Multiple masih jalan, tag salah yang
+    // sama bisa langsung terbaca dan ter-link lagi.
+    try {
+      await ref.read(isScanningProvider.notifier).stop();
+    } catch (_) {}
+
+    // Kosongkan log tag supaya EPC lama tidak dianggap bacaan baru.
+    ref.read(scannedTagsProvider.notifier).clearTags();
+    ref.read(registerProvider.notifier).unlinkRfid(sn);
+
+    if (!context.mounted) return;
+    _showMessage(
+      context,
+      'RFID dilepas dari SN $sn. Silakan tembak RFID yang benar.',
+      Colors.orange,
+    );
+  }
+
+  // ============================================================
+  // ALUR KONVERSI: muat foto -> dialog rotasi -> putar file ->
+  // OCR -> dialog review -> tambah SN
+  // ============================================================
   Future<void> _convertSnPhotosToText(
     BuildContext context,
     WidgetRef ref,
   ) async {
+    final notifier = ref.read(registerProvider.notifier);
+
     try {
-      final result = await ref
-          .read(registerProvider.notifier)
-          .convertSnPhotosToText();
+      // Tahap 1: ambil foto tersimpan lalu tampilkan dialog rotasi
+      final photos = await notifier.loadSnPhotosForSelectedMaterial();
+      if (!context.mounted) return;
+
+      if (photos.isEmpty) {
+        final code =
+            ref.read(registerProvider).selectedMaterial?.material ?? '-';
+        _showMessage(
+          context,
+          'Belum ada foto SN tersimpan untuk material $code.',
+          Colors.orange,
+        );
+        return;
+      }
+
+      final turns = await showDialog<List<int>>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => _SnRotationDialog(photos: photos),
+      );
+      if (turns == null || !context.mounted) return;
+
+      // Terapkan rotasi ke file, lalu buang cache gambar supaya thumbnail
+      // di dialog review ikut berubah.
+      for (var i = 0; i < photos.length; i++) {
+        if (turns[i] % 4 == 0) continue;
+        await SnPhotoRotationService.rotateInPlace(photos[i].path, turns[i]);
+        await FileImage(File(photos[i].path)).evict();
+      }
+      if (!context.mounted) return;
+
+      // Buang cache gambar (termasuk thumbnail ter-resize) agar tampilan
+      // memakai file hasil rotasi.
+      PaintingBinding.instance.imageCache
+        ..clear()
+        ..clearLiveImages();
+
+      // Tahap 2: kirim foto (yang sudah dirotasi) ke OCR
+      final result = await notifier.convertSnPhotosToText(photos: photos);
       if (!context.mounted) return;
 
       if (result.photoCount == 0) {
@@ -397,16 +534,17 @@ class SnListCard extends ConsumerWidget {
         return;
       }
 
-      final serialNumbers = await showDialog<List<String>>(
+      final drafts = await showDialog<List<SnDraft>>(
         context: context,
         barrierDismissible: false,
         builder: (_) => _SnConversionReviewDialog(result: result),
       );
-      if (serialNumbers == null || !context.mounted) return;
+      if (drafts == null || !context.mounted) return;
 
-      final addedCount = ref
-          .read(registerProvider.notifier)
-          .addSnBatch(serialNumbers, material: result.material);
+      final addedCount = notifier.addSnDrafts(
+        drafts,
+        material: result.material,
+      );
 
       _showMessage(
         context,
@@ -514,6 +652,8 @@ class SnListCard extends ConsumerWidget {
 
   Widget _snExpansion({
     required String sn,
+    required String? photoPath,
+    required VoidCallback? onPhotoTap,
     required String epc,
     required String rssi,
     required bool linked,
@@ -526,6 +666,8 @@ class SnListCard extends ConsumerWidget {
     required VoidCallback onRemove,
     required ValueChanged<TireCondition> onConditionChanged,
     required ValueChanged<String> onRemarksChanged,
+    required VoidCallback? onEdit,
+    required VoidCallback? onUnlinkRfid,
   }) {
     return Container(
       decoration: BoxDecoration(
@@ -559,28 +701,11 @@ class SnListCard extends ConsumerWidget {
             }
           },
 
-          leading: CircleAvatar(
-            radius: 18,
-
-            backgroundColor: selected
-                ? const Color(0xFFEAF1FF)
-                : linked
-                ? Colors.green.shade100
-                : Colors.orange.shade100,
-
-            child: Icon(
-              selected
-                  ? Icons.sensors_rounded
-                  : linked
-                  ? Icons.check
-                  : Icons.access_time,
-
-              color: selected
-                  ? AppColor.primary
-                  : linked
-                  ? Colors.green
-                  : Colors.orange,
-            ),
+          leading: _snLeading(
+            photoPath: photoPath,
+            onPhotoTap: onPhotoTap,
+            selected: selected,
+            linked: linked,
           ),
 
           title: Text(
@@ -628,6 +753,11 @@ class SnListCard extends ConsumerWidget {
 
           children: [
             const Divider(),
+
+            if (photoPath != null && photoPath.isNotEmpty) ...[
+              _photoPreviewCard(photoPath: photoPath, onTap: onPhotoTap),
+              const SizedBox(height: 12),
+            ],
 
             Container(
               width: double.infinity,
@@ -807,26 +937,162 @@ class SnListCard extends ConsumerWidget {
 
             const SizedBox(height: 10),
 
-            SizedBox(
-              width: double.infinity,
+            // ====================================
+            // AKSI: EDIT SN, HAPUS RFID, HAPUS SN
+            // ====================================
+            _SnActionBar(
+              onEdit: onEdit,
+              onUnlinkRfid: onUnlinkRfid,
+              onRemove: onRemove,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
-              child: OutlinedButton.icon(
-                onPressed: onRemove,
+  // Leading tile: thumbnail foto + badge status, atau ikon status saja
+  // kalau SN tidak punya foto.
+  Widget _snLeading({
+    required String? photoPath,
+    required VoidCallback? onPhotoTap,
+    required bool selected,
+    required bool linked,
+  }) {
+    final statusColor = selected
+        ? AppColor.primary
+        : linked
+        ? Colors.green
+        : Colors.orange;
+    final statusBackground = selected
+        ? const Color(0xFFEAF1FF)
+        : linked
+        ? Colors.green.shade100
+        : Colors.orange.shade100;
+    final statusIcon = selected
+        ? Icons.sensors_rounded
+        : linked
+        ? Icons.check
+        : Icons.access_time;
 
-                icon: const Icon(Icons.delete_outline, color: Colors.red),
+    if (photoPath == null || photoPath.isEmpty) {
+      return CircleAvatar(
+        radius: 18,
+        backgroundColor: statusBackground,
+        child: Icon(statusIcon, color: statusColor),
+      );
+    }
 
-                label: const Text(
-                  'REMOVE SN',
-
-                  style: TextStyle(color: Colors.red),
+    return SizedBox(
+      width: 56,
+      height: 56,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              onTap: onPhotoTap,
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: statusColor, width: 2),
                 ),
-
-                style: OutlinedButton.styleFrom(
-                  side: BorderSide(color: Colors.red.shade200),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: Image.file(
+                    File(photoPath),
+                    fit: BoxFit.cover,
+                    cacheWidth: 200,
+                    gaplessPlayback: true,
+                    errorBuilder: (_, _, _) => Container(
+                      color: statusBackground,
+                      alignment: Alignment.center,
+                      child: Icon(
+                        Icons.broken_image_outlined,
+                        size: 20,
+                        color: statusColor,
+                      ),
+                    ),
+                  ),
                 ),
               ),
             ),
-          ],
+          ),
+          Positioned(
+            right: -5,
+            bottom: -5,
+            child: Container(
+              padding: const EdgeInsets.all(3),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                shape: BoxShape.circle,
+                border: Border.all(color: statusColor, width: 1.5),
+              ),
+              child: Icon(statusIcon, size: 12, color: statusColor),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Foto lebih besar di dalam area expand. Ketuk untuk zoom.
+  Widget _photoPreviewCard({
+    required String photoPath,
+    required VoidCallback? onTap,
+  }) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: Material(
+        color: Colors.black,
+        child: InkWell(
+          onTap: onTap,
+          child: SizedBox(
+            height: 150,
+            width: double.infinity,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                Image.file(
+                  File(photoPath),
+                  fit: BoxFit.contain,
+                  cacheWidth: 900,
+                  gaplessPlayback: true,
+                  errorBuilder: (_, _, _) => const Center(
+                    child: Icon(
+                      Icons.broken_image_outlined,
+                      color: Colors.white70,
+                    ),
+                  ),
+                ),
+                Positioned(
+                  right: 8,
+                  bottom: 8,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.zoom_in, size: 16, color: Colors.white),
+                        SizedBox(width: 4),
+                        Text(
+                          'Perbesar',
+                          style: TextStyle(color: Colors.white, fontSize: 11),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -855,6 +1121,851 @@ class SnListCard extends ConsumerWidget {
   }
 }
 
+// ============================================================
+// PREVIEW FOTO SN (zoom)
+// ============================================================
+void _showSnPhotoPreview(
+  BuildContext context, {
+  required String path,
+  required String sn,
+}) {
+  showDialog<void>(
+    context: context,
+    builder: (dialogContext) => Dialog(
+      backgroundColor: Colors.black,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 24),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              color: Colors.grey.shade900,
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.image_outlined,
+                    color: Colors.white70,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'SN: $sn',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white),
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => Navigator.pop(dialogContext),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: InteractiveViewer(
+                minScale: 0.8,
+                maxScale: 4.0,
+                child: Image.file(
+                  File(path),
+                  fit: BoxFit.contain,
+                  cacheWidth: 2000,
+                  errorBuilder: (_, _, _) => const Padding(
+                    padding: EdgeInsets.all(32),
+                    child: Text(
+                      'Gagal memuat gambar',
+                      style: TextStyle(color: Colors.white70),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              color: Colors.grey.shade900,
+              alignment: Alignment.center,
+              child: const Text(
+                'Cubit layar untuk memperbesar detail teks SN',
+                style: TextStyle(color: Colors.white60, fontSize: 11),
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+// ============================================================
+// BAR AKSI PER SN
+// ============================================================
+class _SnActionBar extends StatelessWidget {
+  const _SnActionBar({
+    required this.onEdit,
+    required this.onUnlinkRfid,
+    required this.onRemove,
+  });
+
+  final VoidCallback? onEdit;
+  final VoidCallback? onUnlinkRfid;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _ActionTile(
+                icon: Icons.edit_outlined,
+                label: 'Edit SN',
+                color: AppColor.primary,
+                background: const Color(0xFFEAF1FF),
+                onTap: onEdit,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _ActionTile(
+                icon: Icons.link_off_rounded,
+                label: 'Hapus RFID',
+                color: const Color(0xFFE65100),
+                background: const Color(0xFFFFF3E0),
+                onTap: onUnlinkRfid,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        TextButton.icon(
+          onPressed: onRemove,
+          icon: const Icon(Icons.delete_outline, size: 18),
+          label: const Text('Hapus SN dari daftar'),
+          style: TextButton.styleFrom(
+            foregroundColor: Colors.red.shade700,
+            minimumSize: const Size(double.infinity, 44),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ActionTile extends StatelessWidget {
+  const _ActionTile({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.background,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+  final Color background;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onTap != null;
+    final fg = enabled ? color : Colors.grey.shade500;
+
+    return Material(
+      color: enabled ? background : Colors.grey.shade100,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: SizedBox(
+          height: 64,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 22, color: fg),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                style: AppFont.style(
+                  size: 12,
+                  weight: FontWeight.w600,
+                  color: fg,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// DIALOG EDIT SN
+// Mengembalikan String SN baru, atau null jika dibatalkan.
+// ============================================================
+class _EditSnDialog extends StatefulWidget {
+  const _EditSnDialog({required this.initialSn});
+
+  final String initialSn;
+
+  @override
+  State<_EditSnDialog> createState() => _EditSnDialogState();
+}
+
+class _EditSnDialogState extends State<_EditSnDialog> {
+  late final TextEditingController _controller;
+
+  String get _value => _controller.text.trim().toUpperCase();
+
+  bool get _canSave =>
+      _value.isNotEmpty && _value != widget.initialSn.trim().toUpperCase();
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialSn)
+      ..selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: widget.initialSn.length,
+      )
+      ..addListener(() => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (!_canSave) return;
+    Navigator.pop(context, _value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isEmpty = _controller.text.trim().isEmpty;
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  radius: 20,
+                  backgroundColor: const Color(0xFFEAF1FF),
+                  child: Icon(
+                    Icons.edit_outlined,
+                    size: 20,
+                    color: AppColor.primary,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'Edit Serial Number',
+                    style: AppFont.style(
+                      size: 16,
+                      weight: FontWeight.w600,
+                      color: AppColor.primary,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF5F8FD),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                children: [
+                  Text(
+                    'SN saat ini',
+                    style: AppFont.style(size: 11, color: Colors.grey.shade600),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      widget.initialSn,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: _controller,
+              autofocus: true,
+              textCapitalization: TextCapitalization.characters,
+              textInputAction: TextInputAction.done,
+              onSubmitted: (_) => _submit(),
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontWeight: FontWeight.w600,
+                fontSize: 16,
+                letterSpacing: .5,
+              ),
+              decoration: InputDecoration(
+                labelText: 'SN baru',
+                errorText: isEmpty ? 'SN tidak boleh kosong' : null,
+                suffixIcon: isEmpty
+                    ? null
+                    : IconButton(
+                        tooltip: 'Kosongkan',
+                        icon: const Icon(Icons.cancel_rounded),
+                        onPressed: _controller.clear,
+                      ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(context),
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size(0, 48),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text('BATAL'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: _canSave ? _submit : null,
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size(0, 48),
+                      backgroundColor: AppColor.primary,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text('SIMPAN'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// DIALOG KONFIRMASI HAPUS RFID
+// Mengembalikan true jika dikonfirmasi.
+// ============================================================
+class _UnlinkRfidDialog extends StatelessWidget {
+  const _UnlinkRfidDialog({required this.sn, required this.epc});
+
+  final String sn;
+  final String epc;
+
+  @override
+  Widget build(BuildContext context) {
+    const orange = Color(0xFFE65100);
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircleAvatar(
+              radius: 28,
+              backgroundColor: Color(0xFFFFF3E0),
+              child: Icon(Icons.link_off_rounded, size: 28, color: orange),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Hapus RFID dari SN ini?',
+              textAlign: TextAlign.center,
+              style: AppFont.style(
+                size: 16,
+                weight: FontWeight.w600,
+                color: AppColor.primary,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              sn,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFF8F0),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFFFFE0B2)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'EPC yang akan dilepas',
+                    style: AppFont.style(size: 11, color: Colors.grey.shade600),
+                  ),
+                  const SizedBox(height: 4),
+                  SelectableText(
+                    epc.isEmpty ? '-' : epc,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'SN akan aktif kembali. Setelah ini, tembak RFID yang benar.',
+              textAlign: TextAlign.center,
+              style: AppFont.style(size: 12, color: Colors.grey.shade700),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size(0, 48),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text('BATAL'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size(0, 48),
+                      backgroundColor: orange,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text('HAPUS RFID'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// DIALOG ROTASI FOTO (tahap 1)
+// Mengembalikan List<int> quarterTurns (0-3, searah jarum jam) per foto,
+// atau null jika dibatalkan.
+// ============================================================
+class _SnRotationDialog extends StatefulWidget {
+  const _SnRotationDialog({required this.photos});
+
+  final List<SnPhotoCapture> photos;
+
+  @override
+  State<_SnRotationDialog> createState() => _SnRotationDialogState();
+}
+
+class _SnRotationDialogState extends State<_SnRotationDialog> {
+  late final List<int> _turns = List.filled(widget.photos.length, 0);
+
+  int get _total => widget.photos.length;
+
+  int get _rotatedCount => _turns.where((t) => t != 0).length;
+
+  void _rotate(int index, int delta) {
+    HapticFeedback.selectionClick();
+    // Operator % Dart selalu non-negatif, jadi -90° (delta 3) aman.
+    setState(() => _turns[index] = (_turns[index] + delta) % 4);
+  }
+
+  void _rotateAll(int delta) {
+    HapticFeedback.selectionClick();
+    setState(() {
+      for (var i = 0; i < _turns.length; i++) {
+        _turns[i] = (_turns[i] + delta) % 4;
+      }
+    });
+  }
+
+  void _reset(int index) => setState(() => _turns[index] = 0);
+
+  void _resetAll() => setState(() => _turns.fillRange(0, _turns.length, 0));
+
+  ButtonStyle get _toolStyle => OutlinedButton.styleFrom(
+    minimumSize: const Size(0, 48),
+    foregroundColor: AppColor.primary,
+    side: const BorderSide(color: AppColor.border),
+    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    textStyle: AppFont.style(
+      size: 13,
+      weight: FontWeight.w500,
+      color: AppColor.primary,
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog.fullscreen(
+      backgroundColor: AppColor.background,
+      child: Scaffold(
+        backgroundColor: AppColor.background,
+        appBar: AppBar(
+          backgroundColor: AppColor.white,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          scrolledUnderElevation: 0,
+          leading: IconButton(
+            tooltip: 'Tutup tanpa memutar',
+            icon: const Icon(Icons.close),
+            onPressed: () => Navigator.pop(context),
+          ),
+          title: Text(
+            'Putar Foto SN',
+            style: AppFont.style(
+              size: 16,
+              weight: FontWeight.w600,
+              color: AppColor.primary,
+            ),
+          ),
+        ),
+        body: Column(
+          children: [
+            _buildSummary(),
+            Expanded(
+              child: ListView.separated(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                itemCount: _total,
+                separatorBuilder: (_, _) => const SizedBox(height: 16),
+                itemBuilder: (context, index) => _photoTile(index),
+              ),
+            ),
+          ],
+        ),
+        bottomNavigationBar: _buildBottomBar(),
+      ),
+    );
+  }
+
+  Widget _buildSummary() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '$_total foto · $_rotatedCount diputar',
+            style: AppFont.style(
+              size: 14,
+              weight: FontWeight.w600,
+              color: AppColor.text,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Putar sampai teks SN terbaca tegak dari kiri ke kanan. '
+            'Ketuk foto untuk memutar 90° ke kanan.',
+            style: AppFont.style(size: 12, color: AppColor.textGrey),
+          ),
+          if (_total > 1) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _rotateAll(3),
+                    icon: const Icon(Icons.rotate_left, size: 20),
+                    label: const Text('Semua kiri'),
+                    style: _toolStyle,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _rotateAll(1),
+                    icon: const Icon(Icons.rotate_right, size: 20),
+                    label: const Text('Semua kanan'),
+                    style: _toolStyle,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: _rotatedCount == 0 ? null : _resetAll,
+                  style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
+                  child: const Text('Reset'),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBottomBar() {
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppColor.white,
+        border: Border(top: BorderSide(color: AppColor.border)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+          child: Row(
+            children: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
+                child: const Text('BATAL'),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: () => Navigator.pop(context, List<int>.of(_turns)),
+                  icon: const Icon(Icons.document_scanner_outlined),
+                  label: Text('KONVERSI $_total FOTO'),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size(0, 48),
+                    backgroundColor: AppColor.primary,
+                    foregroundColor: AppColor.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _photoTile(int index) {
+    final photo = widget.photos[index];
+    final turns = _turns[index];
+    final rotated = turns != 0;
+    // Foto SN berbentuk lebar. Saat tegak (90°/270°) butuh area lebih tinggi.
+    final sideways = turns.isOdd;
+
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: AppColor.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: rotated ? AppColor.secondary : AppColor.border,
+          width: rotated ? 2 : 1,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Foto ${index + 1} dari $_total',
+                    style: AppFont.style(
+                      size: 13,
+                      weight: FontWeight.w600,
+                      color: AppColor.text,
+                    ),
+                  ),
+                ),
+                _statusBadge(rotated: rotated, turns: turns),
+              ],
+            ),
+          ),
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOut,
+            height: sideways ? 280 : 160,
+            width: double.infinity,
+            child: Material(
+              color: AppColor.text,
+              child: Semantics(
+                button: true,
+                label:
+                    'Foto SN ${index + 1}. Ketuk untuk memutar 90 derajat ke kanan.',
+                child: InkWell(
+                  onTap: () => _rotate(index, 1),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: RotatedBox(
+                          quarterTurns: turns,
+                          child: Image.file(
+                            File(photo.path),
+                            fit: BoxFit.contain,
+                            gaplessPlayback: true,
+                            errorBuilder: (_, _, _) => const Center(
+                              child: Icon(
+                                Icons.broken_image_outlined,
+                                color: AppColor.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        right: 8,
+                        bottom: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppColor.black.withValues(alpha: .6),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Icons.rotate_right,
+                                size: 16,
+                                color: AppColor.white,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                'Ketuk',
+                                style: AppFont.style(
+                                  size: 11,
+                                  color: AppColor.white,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _rotate(index, 3),
+                    icon: const Icon(Icons.rotate_left, size: 20),
+                    label: const Text('Kiri'),
+                    style: _toolStyle,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _rotate(index, 1),
+                    icon: const Icon(Icons.rotate_right, size: 20),
+                    label: const Text('Kanan'),
+                    style: _toolStyle,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: rotated ? () => _reset(index) : null,
+                  style: TextButton.styleFrom(minimumSize: const Size(48, 48)),
+                  child: const Text('Reset'),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _statusBadge({required bool rotated, required int turns}) {
+    if (!rotated) {
+      return Text(
+        'Posisi asli',
+        style: AppFont.style(size: 12, color: AppColor.textGrey),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: AppColor.secondary.withValues(alpha: .25),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        'Diputar ${turns * 90}°',
+        style: AppFont.style(
+          size: 12,
+          weight: FontWeight.w600,
+          color: AppColor.text,
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// DIALOG REVIEW HASIL OCR (tahap 2)
+// ============================================================
 class _SnConversionReviewDialog extends StatefulWidget {
   const _SnConversionReviewDialog({required this.result});
 
@@ -870,8 +1981,43 @@ class _SnConversionReviewDialogState extends State<_SnConversionReviewDialog> {
       .map((result) => result.serialNumber ?? '')
       .toList();
 
-  int get _filledCount =>
-      _serialNumbers.where((value) => value.trim().isNotEmpty).length;
+  late final List<bool> _selected = widget.result.photoResults
+      .map((result) => (result.serialNumber ?? '').trim().isNotEmpty)
+      .toList();
+
+  bool get _isAllSelected =>
+      _selected.isNotEmpty && _selected.every((element) => element);
+
+  int get _selectedCount => _selected.where((element) => element).length;
+
+  List<SnDraft> get _selectedDrafts {
+    final values = <SnDraft>[];
+    for (var i = 0; i < widget.result.photoResults.length; i++) {
+      if (_selected[i]) {
+        final sn = _serialNumbers[i].trim().toUpperCase().replaceAll(
+          RegExp(r'\s+'),
+          '',
+        );
+        if (sn.isNotEmpty) {
+          values.add(
+            SnDraft(sn, photoPath: widget.result.photoResults[i].photo.path),
+          );
+        }
+      }
+    }
+    return values;
+  }
+
+  int get _validSelectedCount => _selectedDrafts.length;
+
+  void _toggleSelectAll() {
+    setState(() {
+      final target = !_isAllSelected;
+      for (var i = 0; i < _selected.length; i++) {
+        _selected[i] = target;
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -892,7 +2038,36 @@ class _SnConversionReviewDialogState extends State<_SnConversionReviewDialog> {
                 '${widget.result.recognizedCount} dari ${widget.result.photoCount} foto memiliki kandidat SN. Koreksi atau isi manual sebelum ditambahkan.',
                 style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '$_selectedCount dari ${widget.result.photoResults.length} foto dipilih',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.grey.shade800,
+                      ),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: _toggleSelectAll,
+                    icon: Icon(
+                      _isAllSelected ? Icons.deselect : Icons.select_all,
+                      size: 18,
+                    ),
+                    label: Text(_isAllSelected ? 'BATAL SEMUA' : 'PILIH SEMUA'),
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
               Flexible(
                 child: ListView.separated(
                   shrinkWrap: true,
@@ -911,22 +2086,13 @@ class _SnConversionReviewDialogState extends State<_SnConversionReviewDialog> {
           child: const Text('BATAL'),
         ),
         FilledButton.icon(
-          onPressed: _filledCount == 0
+          onPressed: _validSelectedCount == 0
               ? null
               : () {
-                  final values = _serialNumbers
-                      .map(
-                        (value) => value.trim().toUpperCase().replaceAll(
-                          RegExp(r'\s+'),
-                          '',
-                        ),
-                      )
-                      .where((value) => value.isNotEmpty)
-                      .toList();
-                  Navigator.pop(context, values);
+                  Navigator.pop(context, _selectedDrafts);
                 },
           icon: const Icon(Icons.playlist_add_check),
-          label: Text('TAMBAHKAN ($_filledCount)'),
+          label: Text('TAMBAHKAN ($_validSelectedCount)'),
         ),
       ],
     );
@@ -1017,19 +2183,123 @@ class _SnConversionReviewDialogState extends State<_SnConversionReviewDialog> {
   Widget _resultEditor(int index) {
     final result = widget.result.photoResults[index];
     final hasCandidate = _serialNumbers[index].trim().isNotEmpty;
+    final isSelected = _selected[index];
 
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: hasCandidate ? Colors.green.shade50 : Colors.orange.shade50,
+        color: !isSelected
+            ? Colors.grey.shade100
+            : (hasCandidate ? Colors.green.shade50 : Colors.orange.shade50),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: hasCandidate ? Colors.green.shade200 : Colors.orange.shade200,
+          color: !isSelected
+              ? Colors.grey.shade300
+              : (hasCandidate ? Colors.green.shade200 : Colors.orange.shade200),
         ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          Row(
+            children: [
+              SizedBox(
+                width: 24,
+                height: 24,
+                child: Checkbox(
+                  value: isSelected,
+                  onChanged: (value) {
+                    setState(() {
+                      _selected[index] = value ?? false;
+                    });
+                  },
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+              const SizedBox(width: 8),
+              InkWell(
+                onTap: () {
+                  setState(() {
+                    _selected[index] = !_selected[index];
+                  });
+                },
+                borderRadius: BorderRadius.circular(4),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 4,
+                    vertical: 2,
+                  ),
+                  child: Text(
+                    'Foto #${index + 1}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: isSelected ? Colors.black87 : Colors.grey.shade600,
+                    ),
+                  ),
+                ),
+              ),
+              const Spacer(),
+              if (result.error != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.red.shade100,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Text(
+                    'Gagal OCR',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Colors.red,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                )
+              else if (hasCandidate)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.green.shade100,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    'Terdeteksi',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Colors.green.shade800,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                )
+              else
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.orange.shade100,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    'Manual',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Colors.orange.shade900,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -1081,7 +2351,12 @@ class _SnConversionReviewDialogState extends State<_SnConversionReviewDialog> {
                   initialValue: _serialNumbers[index],
                   textCapitalization: TextCapitalization.characters,
                   onChanged: (value) {
-                    setState(() => _serialNumbers[index] = value);
+                    setState(() {
+                      _serialNumbers[index] = value;
+                      if (value.trim().isNotEmpty) {
+                        _selected[index] = true;
+                      }
+                    });
                   },
                   decoration: InputDecoration(
                     isDense: true,
@@ -1090,7 +2365,9 @@ class _SnConversionReviewDialogState extends State<_SnConversionReviewDialog> {
                     border: const OutlineInputBorder(),
                     suffixIcon: Icon(
                       hasCandidate ? Icons.check_circle : Icons.edit_outlined,
-                      color: hasCandidate ? Colors.green : Colors.orange,
+                      color: isSelected
+                          ? (hasCandidate ? Colors.green : Colors.orange)
+                          : Colors.grey,
                     ),
                   ),
                 ),
