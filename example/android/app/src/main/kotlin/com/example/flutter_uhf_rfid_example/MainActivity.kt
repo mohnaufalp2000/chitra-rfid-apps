@@ -1,8 +1,12 @@
 package com.example.flutter_uhf_rfid_example
 
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.view.KeyEvent
 import com.example.flutter_uhf_rfid.FlutterUhfRfidPlugin
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
 
 /**
  * The physical scan trigger must be captured here, in the host Activity — a
@@ -35,6 +39,34 @@ class MainActivity : FlutterActivity() {
         KeyEvent.KEYCODE_BRIGHTNESS_DOWN,
         KeyEvent.KEYCODE_BRIGHTNESS_UP,
     )
+
+    /** Dipakai untuk nada error (SN gagal terbaca / foto blur). */
+    private var tone: ToneGenerator? = null
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "app/feedback_tone")
+            .setMethodCallHandler { call, result ->
+                if (call.method == "error") {
+                    try {
+                        tone?.release()
+                        tone = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
+                        tone?.startTone(ToneGenerator.TONE_SUP_ERROR, 600)
+                    } catch (_: Exception) {
+                        // Gagal membuat nada: abaikan, getar tetap jalan dari Dart.
+                    }
+                    result.success(null)
+                } else {
+                    result.notImplemented()
+                }
+            }
+    }
+
+    override fun onDestroy() {
+        tone?.release()
+        tone = null
+        super.onDestroy()
+    }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.keyCode !in systemKeys) {

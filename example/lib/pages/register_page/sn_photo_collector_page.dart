@@ -6,6 +6,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_uhf_rfid_example/providers.dart';
+import 'package:flutter_uhf_rfid_example/services/scan_feedback.dart';
 import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_crop_service.dart';
 import 'package:flutter_uhf_rfid_example/styles/color.dart';
 
@@ -615,7 +616,6 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
         unawaited(_processSaveQueue());
 
         if (mounted) {
-          ref.read(uhfReaderProvider).beep();
           setState(() {
             _errorMessage = null;
             _statusMessage =
@@ -692,6 +692,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
                   '${_captures.length} foto tersimpan. Tekan gun untuk foto berikutnya.\n'
                   'Ketajaman ${capture.sharpness?.toStringAsFixed(0) ?? '-'} • Fokus ${_lastFocusMs}ms • Jepret ${_lastShotMs}ms • Simpan ${tSave.elapsedMilliseconds}ms';
             });
+            ScanFeedback(ref.read(uhfReaderProvider)).success();
           } else {
             _pendingSourcePaths.remove(sourcePath);
           }
@@ -703,7 +704,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
             name: 'SnPhotoCollector',
           );
           _pendingSourcePaths.remove(sourcePath);
-          unawaited(HapticFeedback.heavyImpact());
+          unawaited(ScanFeedback(ref.read(uhfReaderProvider)).failure());
           if (mounted) {
             setState(() {
               _lastShotBlurry = true;
@@ -721,6 +722,7 @@ class _SnPhotoCollectorPageState extends ConsumerState<SnPhotoCollectorPage>
           );
           _pendingSourcePaths.remove(sourcePath);
           if (mounted) {
+            unawaited(ScanFeedback(ref.read(uhfReaderProvider)).failure());
             setState(() {
               _errorMessage = error.toString().replaceFirst('Exception: ', '');
               _statusMessage =

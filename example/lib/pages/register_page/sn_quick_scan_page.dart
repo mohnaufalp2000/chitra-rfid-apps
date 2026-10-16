@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_uhf_rfid_example/pages/register_page/register_provider.dart';
 import 'package:flutter_uhf_rfid_example/providers.dart';
+import 'package:flutter_uhf_rfid_example/services/scan_feedback.dart';
 import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_crop_service.dart';
 
 /// Foto satu SN -> langsung kirim ke API detector -> popup "Tambahkan SN".
@@ -308,7 +309,6 @@ class _SnQuickScanPageState extends ConsumerState<SnQuickScanPage>
       final shot = await controller.takePicture();
       sourcePath = shot.path;
       unawaited(_prefocus(controller, resetPoint: false));
-      if (mounted) ref.read(uhfReaderProvider).beep();
 
       // Simpan + cek ketajaman. Foto blur dilempar sebagai exception dan
       // TIDAK dikirim ke API.
@@ -318,6 +318,9 @@ class _SnQuickScanPageState extends ConsumerState<SnQuickScanPage>
         materialCode: _storageCode,
       );
       savedPath = saved.path;
+
+      // Foto lolos cek blur: beep reader seperti biasa.
+      if (mounted) ScanFeedback(ref.read(uhfReaderProvider)).success();
 
       // Kode material asli yang dikirim ke API, bukan nama folder penyimpanan.
       final photo = SnPhotoCapture(
@@ -387,7 +390,8 @@ class _SnQuickScanPageState extends ConsumerState<SnQuickScanPage>
       await _finish();
     } on SnPhotoBlurException catch (error) {
       developer.log('Photo rejected as blurry: $error', name: 'SnQuickScan');
-      unawaited(HapticFeedback.heavyImpact());
+      // Foto blur: bunyi lain (nada error dari speaker HP + getar), bukan beep.
+      unawaited(ScanFeedback(ref.read(uhfReaderProvider)).failure());
       if (mounted) {
         setState(() {
           _error = '$error. Foto tidak dikirim.';
