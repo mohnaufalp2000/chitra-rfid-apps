@@ -67,9 +67,20 @@ class RegisterPage extends ConsumerStatefulWidget {
 }
 
 class _RegisterPageState extends ConsumerState<RegisterPage> {
+  late final PhysicalTriggerCoordinator _triggerCoordinator;
+  late final Future<void> Function() _stopScanning;
+
   @override
   void initState() {
     super.initState();
+
+    _triggerCoordinator = ref.read(physicalTriggerCoordinatorProvider);
+    _triggerCoordinator.mode = PhysicalTriggerMode.rfid;
+
+    final scanNotifier = ref.read(isScanningProvider.notifier);
+    _stopScanning = () async {
+      await scanNotifier.stop();
+    };
 
     Future.microtask(() async {
       // supaya provider RFID aktif
@@ -81,6 +92,20 @@ class _RegisterPageState extends ConsumerState<RegisterPage> {
 
       await _autoConnectRfid();
     });
+  }
+
+  @override
+  void dispose() {
+    _triggerCoordinator.mode = PhysicalTriggerMode.disabled;
+    final stopScanning = _stopScanning;
+    Future.microtask(() async {
+      try {
+        await stopScanning();
+      } catch (_) {
+        // Provider mungkin sudah ter-dispose, abaikan.
+      }
+    });
+    super.dispose();
   }
 
   Future<void> _autoConnectRfid() async {

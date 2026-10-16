@@ -21,6 +21,7 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
   // tanpa memakai `ref`. Memakai closure agar tidak perlu menulis nama tipe
   // notifier-nya.
   late final Future<void> Function() _stopScanning;
+  late final PhysicalTriggerCoordinator _triggerCoordinator;
 
   bool _isConnecting = false;
   bool _isProcessingTags = false;
@@ -43,6 +44,9 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
       await scanNotifier.stop();
     };
 
+    _triggerCoordinator = ref.read(physicalTriggerCoordinatorProvider);
+    _triggerCoordinator.mode = PhysicalTriggerMode.rfid;
+
     Future.microtask(() async {
       if (!mounted) return;
       ref.read(scannedTagsProvider);
@@ -55,6 +59,7 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
   void dispose() {
     // Jangan pakai `ref` di sini. Ditunda dengan microtask agar tidak
     // memodifikasi provider saat widget tree sedang di-teardown.
+    _triggerCoordinator.mode = PhysicalTriggerMode.disabled;
     final stopScanning = _stopScanning;
     Future.microtask(() async {
       try {

@@ -38,10 +38,10 @@ enum ScanMode {
   multiple,
 }
 
-enum PhysicalTriggerMode { rfid, camera }
+enum PhysicalTriggerMode { disabled, rfid, camera }
 
 class PhysicalTriggerCoordinator {
-  PhysicalTriggerMode mode = PhysicalTriggerMode.rfid;
+  PhysicalTriggerMode mode = PhysicalTriggerMode.disabled;
 }
 
 // Providers
