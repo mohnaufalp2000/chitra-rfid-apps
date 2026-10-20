@@ -6,6 +6,10 @@ class RfidLookupModel {
   final String plant;
   final String stockLocation;
 
+  /// Ekspedisi yang dicatat saat ban masuk. Null kalau backend tidak
+  /// mengirimnya.
+  final String? ekspedisi;
+
   const RfidLookupModel({
     required this.sn,
     required this.material,
@@ -13,9 +17,12 @@ class RfidLookupModel {
     required this.epc,
     required this.plant,
     required this.stockLocation,
+    this.ekspedisi,
   });
 
   factory RfidLookupModel.fromJson(Map<String, dynamic> json) {
+    final ekspedisi = json['ekspedisi']?.toString().trim();
+
     return RfidLookupModel(
       sn: json['sn']?.toString() ?? '',
       material: json['material']?.toString() ?? '',
@@ -23,6 +30,7 @@ class RfidLookupModel {
       epc: json['epc']?.toString() ?? '',
       plant: json['plant']?.toString() ?? '',
       stockLocation: json['stockLocation']?.toString() ?? '',
+      ekspedisi: (ekspedisi == null || ekspedisi.isEmpty) ? null : ekspedisi,
     );
   }
 
@@ -34,6 +42,7 @@ class RfidLookupModel {
       'epc': epc,
       'plant': plant,
       'stockLocation': stockLocation,
+      if (ekspedisi != null) 'ekspedisi': ekspedisi,
     };
   }
 }

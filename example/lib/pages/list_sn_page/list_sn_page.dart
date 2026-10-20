@@ -7,6 +7,7 @@ import 'package:flutter_uhf_rfid_example/providers.dart';
 import 'package:flutter_uhf_rfid_example/services/models/rfid_lookup_model.dart';
 import 'package:flutter_uhf_rfid_example/styles/color.dart';
 import 'package:flutter_uhf_rfid_example/styles/font.dart';
+import 'package:flutter_uhf_rfid_example/widgets/shipment_info_card.dart';
 import 'package:intl/intl.dart';
 
 class ListSnPage extends ConsumerStatefulWidget {
@@ -121,6 +122,10 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
         padding: const EdgeInsets.only(bottom: 20),
         children: [
           _statusCard(context: context, ref: ref, state: state),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(12, 0, 12, 10),
+            child: OutgoingShipmentCard(),
+          ),
           _itemsHeader(state.items),
           if (state.items.isEmpty)
             _emptyState()
@@ -185,6 +190,15 @@ class _ListSnPageState extends ConsumerState<ListSnPage> {
   }
 
   Future<void> _confirmSaveOutgoing(List<RfidLookupModel> items) async {
+    // Cek kelengkapan data pengiriman sebelum dialog konfirmasi.
+    final shipmentError = ref.read(listSnProvider.notifier).shipmentError;
+    if (shipmentError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(shipmentError), backgroundColor: Colors.red),
+      );
+      return;
+    }
+
     final materialCount = items.map((item) => item.material).toSet().length;
     final confirmed = await showDialog<bool>(
       context: context,

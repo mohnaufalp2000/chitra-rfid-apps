@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:flutter_uhf_rfid_example/services/api/material_service.dart';
@@ -34,6 +36,9 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
        super(RegisterState());
 
   final snController = TextEditingController();
+
+  /// Nama ekspedisi pengirim ban masuk. Dipakai untuk semua SN saat save.
+  final ekspedisiController = TextEditingController();
   final RfidLookup _lookupRfid;
   final RfidRegister _registerRfid;
   final SnPhotoLoader _loadSnPhotos;
@@ -73,11 +78,18 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         throw Exception('Masih ada SN yang belum terhubung RFID');
       }
 
+      final ekspedisi = ekspedisiController.text.trim();
+      if (ekspedisi.isEmpty) {
+        throw Exception('Ekspedisi belum diisi');
+      }
+
       state = state.copyWith(isLoading: true, error: null);
 
       final groupedItems = <(String?, String?, String?), List<SnModel>>{};
 
-      for (final item in state.snList) {
+      for (final item in state.snList.map(
+        (item) => item.copyWith(ekspedisi: ekspedisi),
+      )) {
         final material = item.material!;
         final key = (material.material, material.plnt, material.sloc);
         groupedItems.putIfAbsent(key, () => []).add(item);
@@ -92,7 +104,11 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         );
       }
 
+      // Foto kerusakan tidak dikirim dan tidak disimpan: buang setelah save.
+      _discardDamageFiles(state.snList);
+
       snController.clear();
+      ekspedisiController.clear();
       state = state.copyWith(
         isLoading: false,
         snList: const [],
@@ -236,6 +252,7 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
           tireCondition: item.tireCondition,
           remarks: item.remarks,
           photoPath: item.photoPath,
+          damagePhotos: item.damagePhotos,
         );
       }).toList(),
       selectedSn: sn,
@@ -289,6 +306,7 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
 
   // Fungsi untuk remove SN
   void removeSn(String sn) {
+    _discardDamageFiles(state.snList.where((e) => e.sn == sn));
     final remainingItems = state.snList.where((e) => e.sn != sn).toList();
     final selectedWasRemoved = state.selectedSn == sn;
     final nextSn = selectedWasRemoved
@@ -310,6 +328,47 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         return item.copyWith(
           tireCondition: condition,
           remarks: condition == TireCondition.good ? '' : item.remarks,
+          // Kembali ke GOOD: foto kerusakan ikut dibuang.
+          damagePhotos: condition == TireCondition.good
+              ? const []
+              : item.damagePhotos,
+        );
+      }).toList(),
+    );
+  }
+
+  /// Tambah foto kerusakan (DEMO: hanya disimpan di state, tidak dikirim).
+  void addDamagePhotos(String sn, List<String> paths) {
+    if (paths.isEmpty) return;
+    state = state.copyWith(
+      snList: state.snList.map((item) {
+        if (item.sn != sn) return item;
+        return item.copyWith(damagePhotos: [...item.damagePhotos, ...paths]);
+      }).toList(),
+    );
+  }
+
+  /// Hapus file foto sementara (best effort). Foto kerusakan hanya untuk demo,
+  /// jadi file dibuang begitu tidak dipakai lagi.
+  void _discardDamageFiles(Iterable<SnModel> items) {
+    for (final item in items) {
+      for (final path in item.damagePhotos) {
+        try {
+          File(path).delete().ignore();
+        } catch (_) {}
+      }
+    }
+  }
+
+  void removeDamagePhoto(String sn, String path) {
+    try {
+      File(path).delete().ignore();
+    } catch (_) {}
+    state = state.copyWith(
+      snList: state.snList.map((item) {
+        if (item.sn != sn) return item;
+        return item.copyWith(
+          damagePhotos: item.damagePhotos.where((p) => p != path).toList(),
         );
       }).toList(),
     );
@@ -325,6 +384,7 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
 
   // Hapus seluruh SN, baik yang sudah maupun belum terhubung RFID.
   void clearAllSn() {
+    _discardDamageFiles(state.snList);
     snController.clear();
     state = state.copyWith(snList: const [], clearSelectedSn: true);
   }
@@ -416,6 +476,7 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
   @override
   void dispose() {
     snController.dispose();
+    ekspedisiController.dispose();
     super.dispose();
   }
 }

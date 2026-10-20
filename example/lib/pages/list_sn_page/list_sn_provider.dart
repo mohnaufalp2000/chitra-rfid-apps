@@ -1,5 +1,6 @@
 import 'dart:developer' as developer;
 
+import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:flutter_uhf_rfid_example/services/api/rfid_service.dart';
 import 'package:flutter_uhf_rfid_example/services/models/material_model.dart';
@@ -61,6 +62,21 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
 
   final RfidLookup _lookupRfid;
   final RfidRegister _registerRfid;
+
+  /// Data pengiriman ban keluar. Dipakai untuk semua ban saat save.
+  final platTrukController = TextEditingController();
+  final tujuanController = TextEditingController();
+  final namaDriverController = TextEditingController();
+
+  /// Pesan error kalau data pengiriman belum lengkap, null kalau sudah.
+  String? get shipmentError {
+    if (platTrukController.text.trim().isEmpty) return 'Plat truk belum diisi';
+    if (tujuanController.text.trim().isEmpty) return 'Tujuan belum diisi';
+    if (namaDriverController.text.trim().isEmpty) {
+      return 'Nama driver belum diisi';
+    }
+    return null;
+  }
 
   Future<void> scanByEpc(String epc) async {
     if (state.isSaving) {
@@ -135,6 +151,15 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
       throw Exception('Belum ada ban yang dipindai');
     }
 
+    final shipmentError = this.shipmentError;
+    if (shipmentError != null) {
+      throw Exception(shipmentError);
+    }
+
+    final platTruk = platTrukController.text.trim();
+    final tujuan = tujuanController.text.trim();
+    final namaDriver = namaDriverController.text.trim();
+
     final itemsToSave = List<RfidLookupModel>.from(state.items);
     state = state.copyWith(isSaving: true, clearError: true);
 
@@ -164,6 +189,10 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
                   material: material,
                   epc: item.epc,
                   linked: true,
+                  ekspedisi: item.ekspedisi,
+                  platTruk: platTruk,
+                  tujuan: tujuan,
+                  namaDriver: namaDriver,
                 ),
               )
               .toList(),
@@ -172,6 +201,9 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
         );
       }
 
+      platTrukController.clear();
+      tujuanController.clear();
+      namaDriverController.clear();
       state = const ListSnState();
     } catch (e, stackTrace) {
       developer.log(
@@ -209,6 +241,14 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
 
   void setRetryableError(String message) {
     state = state.copyWith(error: message, canRetry: true);
+  }
+
+  @override
+  void dispose() {
+    platTrukController.dispose();
+    tujuanController.dispose();
+    namaDriverController.dispose();
+    super.dispose();
   }
 }
 

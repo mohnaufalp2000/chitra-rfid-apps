@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_uhf_rfid_example/pages/register_page/damage_photo_page.dart';
 import 'package:flutter_uhf_rfid_example/pages/register_page/register_provider.dart';
 import 'package:flutter_uhf_rfid_example/providers.dart';
 import 'package:flutter_uhf_rfid_example/services/models/sn_model.dart';
@@ -374,6 +375,18 @@ class SnListCard extends ConsumerWidget {
                       item.material?.description ?? 'Material tidak diketahui',
                   tireCondition: item.tireCondition,
                   remarks: item.remarks,
+                  damagePhotos: item.damagePhotos,
+                  onAddDamagePhoto: () =>
+                      _addDamagePhotos(context, ref, item.sn),
+                  onDamagePhotoTap: (path) => _showSnPhotoPreview(
+                    context,
+                    path: path,
+                    sn: item.sn,
+                    title: 'Foto kerusakan',
+                    hint: 'Cubit layar untuk memperbesar',
+                  ),
+                  onRemoveDamagePhoto: (path) =>
+                      notifier.removeDamagePhoto(item.sn, path),
 
                   onSelected: () {
                     notifier.selectSn(item.sn);
@@ -411,6 +424,21 @@ class SnListCard extends ConsumerWidget {
         ),
       ),
     );
+  }
+
+  // ============================================================
+  // FOTO KERUSAKAN (DEMO: hanya ditampilkan, tidak dikirim/disimpan)
+  // ============================================================
+  Future<void> _addDamagePhotos(
+    BuildContext context,
+    WidgetRef ref,
+    String sn,
+  ) async {
+    final photos = await Navigator.of(context).push<List<String>>(
+      MaterialPageRoute(builder: (_) => DamagePhotoPage(sn: sn)),
+    );
+    if (photos == null || photos.isEmpty) return;
+    ref.read(registerProvider.notifier).addDamagePhotos(sn, photos);
   }
 
   // ============================================================
@@ -662,6 +690,10 @@ class SnListCard extends ConsumerWidget {
     required String materialDescription,
     required TireCondition tireCondition,
     required String remarks,
+    required List<String> damagePhotos,
+    required VoidCallback onAddDamagePhoto,
+    required ValueChanged<String> onDamagePhotoTap,
+    required ValueChanged<String> onRemoveDamagePhoto,
     required VoidCallback onSelected,
     required VoidCallback onRemove,
     required ValueChanged<TireCondition> onConditionChanged,
@@ -898,6 +930,13 @@ class SnListCard extends ConsumerWidget {
                   );
                 },
               ),
+              const SizedBox(height: 12),
+              _DamagePhotoSection(
+                photos: damagePhotos,
+                onAdd: onAddDamagePhoto,
+                onTap: onDamagePhotoTap,
+                onRemove: onRemoveDamagePhoto,
+              ),
             ],
 
             const SizedBox(height: 14),
@@ -1128,6 +1167,8 @@ void _showSnPhotoPreview(
   BuildContext context, {
   required String path,
   required String sn,
+  String? title,
+  String hint = 'Cubit layar untuk memperbesar detail teks SN',
 }) {
   showDialog<void>(
     context: context,
@@ -1153,7 +1194,7 @@ void _showSnPhotoPreview(
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'SN: $sn',
+                      title == null ? 'SN: $sn' : '$title · SN: $sn',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
@@ -1194,9 +1235,9 @@ void _showSnPhotoPreview(
               padding: const EdgeInsets.symmetric(vertical: 8),
               color: Colors.grey.shade900,
               alignment: Alignment.center,
-              child: const Text(
-                'Cubit layar untuk memperbesar detail teks SN',
-                style: TextStyle(color: Colors.white60, fontSize: 11),
+              child: Text(
+                hint,
+                style: const TextStyle(color: Colors.white60, fontSize: 11),
               ),
             ),
           ],
@@ -1204,6 +1245,140 @@ void _showSnPhotoPreview(
       ),
     ),
   );
+}
+
+// ============================================================
+// FOTO KERUSAKAN PER SN (kondisi BAD)
+// ============================================================
+class _DamagePhotoSection extends StatelessWidget {
+  const _DamagePhotoSection({
+    required this.photos,
+    required this.onAdd,
+    required this.onTap,
+    required this.onRemove,
+  });
+
+  final List<String> photos;
+  final VoidCallback onAdd;
+  final ValueChanged<String> onTap;
+  final ValueChanged<String> onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: onAdd,
+            icon: const Icon(Icons.photo_camera_outlined),
+            label: Text(
+              photos.isEmpty
+                  ? 'Foto kerusakan'
+                  : 'Tambah foto (${photos.length})',
+            ),
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size.fromHeight(48),
+              foregroundColor: AppColor.primary,
+              side: BorderSide(color: Colors.grey.shade400),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+          ),
+        ),
+        if (photos.isEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              'Belum ada foto. Foto hanya tampil di sini dan tidak dikirim.',
+              style: AppFont.style(size: 11, color: AppColor.textGrey),
+            ),
+          )
+        else ...[
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              for (final path in photos)
+                _DamageThumb(
+                  key: ValueKey(path),
+                  path: path,
+                  onTap: () => onTap(path),
+                  onRemove: () => onRemove(path),
+                ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _DamageThumb extends StatelessWidget {
+  const _DamageThumb({
+    super.key,
+    required this.path,
+    required this.onTap,
+    required this.onRemove,
+  });
+
+  final String path;
+  final VoidCallback onTap;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 84,
+      height: 84,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: InkWell(
+              onTap: onTap,
+              child: Image.file(
+                File(path),
+                fit: BoxFit.cover,
+                cacheWidth: 250,
+                errorBuilder: (_, _, _) => ColoredBox(
+                  color: Colors.grey.shade200,
+                  child: Icon(
+                    Icons.broken_image_outlined,
+                    color: Colors.grey.shade500,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            top: 2,
+            right: 2,
+            child: Tooltip(
+              message: 'Hapus foto',
+              child: InkWell(
+                onTap: onRemove,
+                borderRadius: BorderRadius.circular(16),
+                child: Container(
+                  width: 28,
+                  height: 28,
+                  decoration: const BoxDecoration(
+                    color: Colors.black54,
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.close, size: 16, color: Colors.white),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 // ============================================================

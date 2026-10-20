@@ -17,18 +17,46 @@ class RfidService {
     return RfidHistoryResponse.fromJson(response);
   }
 
+  /// Body untuk POST /rfid. Dipisah supaya bisa dites tanpa memanggil jaringan.
+  static Map<String, dynamic> buildRegisterBody({
+    required MaterialModel material,
+    required List<SnModel> items,
+    required String createdBy,
+    required RfidMovementStatus status,
+    DateTime? now,
+  }) {
+    return {
+      "material": material.toJson(),
+      "items": items.map((item) {
+        final json = item.toJson();
+
+        // Ban keluar tidak membawa data kondisi ban. Nilainya hanya default
+        // aplikasi (GOOD), jadi jangan dikirim agar tidak menimpa kondisi
+        // yang dicatat saat ban masuk.
+        if (status == RfidMovementStatus.keluar) {
+          json.remove('tire_condition');
+          json.remove('remarks');
+        }
+
+        return json;
+      }).toList(),
+      "createdBy": createdBy,
+      "createdAt": (now ?? DateTime.now()).toIso8601String(),
+    };
+  }
+
   static Future<dynamic> registerRfid({
     required MaterialModel material,
     required List<SnModel> items,
     required String createdBy,
     required RfidMovementStatus status,
   }) async {
-    final body = {
-      "material": material.toJson(),
-      "items": items.map((item) => item.toJson()).toList(),
-      "createdBy": createdBy,
-      "createdAt": DateTime.now().toIso8601String(),
-    };
+    final body = buildRegisterBody(
+      material: material,
+      items: items,
+      createdBy: createdBy,
+      status: status,
+    );
 
     final response = await ApiClient.post(
       '/rfid?status=${status.name}',
