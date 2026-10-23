@@ -208,14 +208,9 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         b
           ..writeln()
           ..writeln('*${n + 1}. SN: ${i.sn}*')
-          ..writeln('     EPC     : ${orDash(i.epc)}')
-          ..writeln('     RSSI    : ${orDash(i.rssi)}')
           ..writeln('     Kondisi : ${isGood ? '✅ GOOD' : '⚠️ BAD'}');
         if (i.remarks.trim().isNotEmpty) {
           b.writeln('     Catatan : ${i.remarks.trim()}');
-        }
-        if (i.damagePhotos.isNotEmpty) {
-          b.writeln('     Foto rusak : ${i.damagePhotos.length}');
         }
       }
     }

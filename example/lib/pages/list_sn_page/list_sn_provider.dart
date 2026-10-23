@@ -1,11 +1,14 @@
+import 'dart:async';
 import 'dart:developer' as developer;
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:flutter_uhf_rfid_example/services/api/rfid_service.dart';
+import 'package:flutter_uhf_rfid_example/services/api/whatsapp_service.dart';
 import 'package:flutter_uhf_rfid_example/services/models/material_model.dart';
 import 'package:flutter_uhf_rfid_example/services/models/rfid_lookup_model.dart';
 import 'package:flutter_uhf_rfid_example/services/models/sn_model.dart';
+import 'package:intl/intl.dart';
 
 typedef RfidLookup = Future<RfidLookupModel?> Function(String epc);
 typedef RfidRegister =
@@ -55,13 +58,18 @@ class ListSnState {
 }
 
 class ListSnNotifier extends StateNotifier<ListSnState> {
-  ListSnNotifier({RfidLookup? lookupRfid, RfidRegister? registerRfid})
-    : _lookupRfid = lookupRfid ?? RfidService.findByEpc,
-      _registerRfid = registerRfid ?? RfidService.registerRfid,
-      super(const ListSnState());
+  ListSnNotifier({
+    RfidLookup? lookupRfid,
+    RfidRegister? registerRfid,
+    Future<void> Function(String message)? sendWhatsapp,
+  }) : _lookupRfid = lookupRfid ?? RfidService.findByEpc,
+       _registerRfid = registerRfid ?? RfidService.registerRfid,
+       _sendWhatsapp = sendWhatsapp ?? WhatsappService.send,
+       super(const ListSnState());
 
   final RfidLookup _lookupRfid;
   final RfidRegister _registerRfid;
+  final Future<void> Function(String message) _sendWhatsapp;
 
   /// Data pengiriman ban keluar. Dipakai untuk semua ban saat save.
   final platTrukController = TextEditingController();
@@ -201,6 +209,25 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
         );
       }
 
+      // Ringkasan WA dibuat sebelum form dan daftar dikosongkan. Dikirim
+      // sekali per save, tidak di-await, dan gagal kirim tidak membatalkan
+      // save.
+      final waMessage = _buildWaSummary(
+        groupedItems.values.toList(),
+        platTruk: platTruk,
+        tujuan: tujuan,
+        namaDriver: namaDriver,
+        now: DateTime.now(),
+      );
+      unawaited(
+        _sendWhatsapp(waMessage).catchError((Object e) {
+          developer.log(
+            'Kirim WA ban keluar gagal: $e',
+            name: 'ListSnNotifier',
+          );
+        }),
+      );
+
       platTrukController.clear();
       tujuanController.clear();
       namaDriverController.clear();
@@ -223,6 +250,72 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
       );
       rethrow;
     }
+  }
+
+  /// Teks WA ban keluar: data pengiriman + total, lalu satu blok per material
+  /// (dengan pembatas dan jumlahnya), lalu detail tiap ban.
+  String _buildWaSummary(
+    List<List<RfidLookupModel>> groups, {
+    required String platTruk,
+    required String tujuan,
+    required String namaDriver,
+    required DateTime now,
+  }) {
+    const line = '━━━━━━━━━━━━━━';
+
+    String orDash(String? value) =>
+        (value == null || value.trim().isEmpty) ? '-' : value.trim();
+
+    final total = groups.fold<int>(0, (sum, items) => sum + items.length);
+
+    final b = StringBuffer()
+      ..writeln('*🚛 BAN KELUAR*')
+      ..writeln(line)
+      ..writeln('🕒 Waktu      : ${DateFormat('dd/MM/yyyy HH:mm').format(now)}')
+      ..writeln('🔖 Plat truk : $platTruk')
+      ..writeln('📍 Tujuan     : $tujuan')
+      ..writeln('👤 Driver      : $namaDriver')
+      ..writeln('🔢 Total        : *$total ban*');
+
+    // Rekap singkat per material, hanya kalau lebih dari satu material.
+    if (groups.length > 1) {
+      b
+        ..writeln()
+        ..writeln('*Rekap per material*');
+      for (final items in groups) {
+        b.writeln('• ${orDash(items.first.material)} → *${items.length} ban*');
+      }
+    }
+
+    for (var g = 0; g < groups.length; g++) {
+      final items = groups[g];
+      final first = items.first;
+
+      b
+        ..writeln()
+        ..writeln(line)
+        ..writeln('*MATERIAL ${g + 1} dari ${groups.length}*')
+        ..writeln('Kode       : ${orDash(first.material)}')
+        ..writeln('Deskripsi  : ${orDash(first.description)}')
+        ..writeln(
+          'Plant/SLoc : ${orDash(first.plant)} / ${orDash(first.stockLocation)}',
+        )
+        ..writeln('Jumlah     : *${items.length} ban*');
+
+      for (var n = 0; n < items.length; n++) {
+        final i = items[n];
+
+        b
+          ..writeln()
+          ..writeln('*${n + 1}. SN: ${orDash(i.sn)}*');
+      }
+    }
+
+    b
+      ..writeln()
+      ..writeln(line)
+      ..write('*TOTAL: $total ban*');
+    return b.toString();
   }
 
   void removeItem(String epc) {
