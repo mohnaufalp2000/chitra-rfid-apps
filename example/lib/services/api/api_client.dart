@@ -33,7 +33,12 @@ class ApiClient {
     try {
       data = jsonDecode(response.body);
     } catch (_) {
-      throw Exception('Response server tidak valid');
+      final body = response.body.trim();
+      final preview = body.length > 150 ? '${body.substring(0, 150)}...' : body;
+      throw Exception(
+        'Response server tidak valid (HTTP ${response.statusCode}) '
+        '[$endpoint]: $preview',
+      );
     }
 
     if (response.statusCode >= 200 && response.statusCode < 300) {

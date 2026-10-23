@@ -1,14 +1,18 @@
+import 'dart:async';
+import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:flutter_uhf_rfid_example/services/api/material_service.dart';
 import 'package:flutter_uhf_rfid_example/services/api/rfid_service.dart';
+import 'package:flutter_uhf_rfid_example/services/api/whatsapp_service.dart';
 import 'package:flutter_uhf_rfid_example/services/models/material_model.dart';
 import 'package:flutter_uhf_rfid_example/services/models/rfid_lookup_model.dart';
 import 'package:flutter_uhf_rfid_example/services/models/sn_model.dart';
 import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_conversion_service.dart';
 import 'package:flutter_uhf_rfid_example/services/sn_photo/sn_photo_crop_service.dart';
+import 'package:intl/intl.dart';
 
 typedef RfidLookup = Future<RfidLookupModel?> Function(String epc);
 typedef RfidRegister =
@@ -18,6 +22,7 @@ typedef RfidRegister =
       required String createdBy,
       required RfidMovementStatus status,
     });
+typedef WhatsappSender = Future<void> Function(String message);
 typedef SnPhotoLoader =
     Future<List<SnPhotoCapture>> Function(String materialCode);
 typedef SnPhotoConverter =
@@ -27,10 +32,12 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
   RegisterNotifier({
     RfidLookup? lookupRfid,
     RfidRegister? registerRfid,
+    WhatsappSender? sendWhatsapp,
     SnPhotoLoader? loadSnPhotos,
     SnPhotoConverter? convertSnPhotos,
   }) : _lookupRfid = lookupRfid ?? RfidService.findByEpc,
        _registerRfid = registerRfid ?? RfidService.registerRfid,
+       _sendWhatsapp = sendWhatsapp ?? WhatsappService.send,
        _loadSnPhotos = loadSnPhotos ?? SnPhotoCropService().loadForMaterial,
        _convertSnPhotos = convertSnPhotos ?? SnPhotoConversionService().convert,
        super(RegisterState());
@@ -41,6 +48,7 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
   final ekspedisiController = TextEditingController();
   final RfidLookup _lookupRfid;
   final RfidRegister _registerRfid;
+  final WhatsappSender _sendWhatsapp;
   final SnPhotoLoader _loadSnPhotos;
   final SnPhotoConverter _convertSnPhotos;
   bool _epcCheckInProgress = false;
@@ -104,6 +112,19 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         );
       }
 
+      // Ringkasan WA dibuat sebelum snList dikosongkan. Dikirim sekali per
+      // save, tidak di-await, dan gagal kirim tidak membatalkan save.
+      final waMessage = _buildWaSummary(
+        groupedItems.values.toList(),
+        ekspedisi,
+        DateTime.now(),
+      );
+      unawaited(
+        _sendWhatsapp(waMessage).catchError((Object e) {
+          developer.log('Kirim WA gagal: $e', name: 'RegisterNotifier');
+        }),
+      );
+
       // Foto kerusakan tidak dikirim dan tidak disimpan: buang setelah save.
       _discardDamageFiles(state.snList);
 
@@ -120,6 +141,90 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
 
       rethrow;
     }
+  }
+
+  /// Teks WA: total ban + semua informasi tiap ban. Harus dipanggil sebelum
+  /// snList dikosongkan.
+  /// Teks WA: ringkasan total, lalu satu blok per material (dengan pembatas
+  /// dan jumlahnya), lalu detail tiap ban. Harus dipanggil sebelum snList
+  /// dikosongkan.
+  String _buildWaSummary(
+    List<List<SnModel>> groups,
+    String ekspedisi,
+    DateTime now,
+  ) {
+    const line = '━━━━━━━━━━━━━━';
+
+    int countGood(Iterable<SnModel> items) =>
+        items.where((i) => i.tireCondition == TireCondition.good).length;
+
+    String orDash(String? value) =>
+        (value == null || value.trim().isEmpty) ? '-' : value.trim();
+
+    final total = groups.fold<int>(0, (sum, items) => sum + items.length);
+    final totalGood = groups.fold<int>(
+      0,
+      (sum, items) => sum + countGood(items),
+    );
+
+    final b = StringBuffer()
+      ..writeln('*📦 BAN MASUK*')
+      ..writeln(line)
+      ..writeln('🕒 Waktu     : ${DateFormat('dd/MM/yyyy HH:mm').format(now)}')
+      ..writeln('🚚 Ekspedisi : $ekspedisi')
+      ..writeln('🔢 Total     : *$total ban*')
+      ..writeln('✅ GOOD: $totalGood    ⚠️ BAD: ${total - totalGood}');
+
+    // Rekap singkat per material, hanya kalau lebih dari satu material.
+    if (groups.length > 1) {
+      b
+        ..writeln()
+        ..writeln('*Rekap per material*');
+      for (final items in groups) {
+        final m = items.first.material!;
+        b.writeln('• ${orDash(m.material)} → *${items.length} ban*');
+      }
+    }
+
+    for (var g = 0; g < groups.length; g++) {
+      final items = groups[g];
+      final m = items.first.material!;
+      final good = countGood(items);
+
+      b
+        ..writeln()
+        ..writeln(line)
+        ..writeln('*MATERIAL ${g + 1} dari ${groups.length}*')
+        ..writeln('Kode       : ${orDash(m.material)}')
+        ..writeln('Deskripsi  : ${orDash(m.description)}')
+        ..writeln('Plant/SLoc : ${orDash(m.plnt)} / ${orDash(m.sloc)}')
+        ..writeln('Jumlah     : *${items.length} ban* ')
+        ..writeln('(GOOD $good | BAD ${items.length - good})');
+
+      for (var n = 0; n < items.length; n++) {
+        final i = items[n];
+        final isGood = i.tireCondition == TireCondition.good;
+
+        b
+          ..writeln()
+          ..writeln('*${n + 1}. SN: ${i.sn}*')
+          ..writeln('     EPC     : ${orDash(i.epc)}')
+          ..writeln('     RSSI    : ${orDash(i.rssi)}')
+          ..writeln('     Kondisi : ${isGood ? '✅ GOOD' : '⚠️ BAD'}');
+        if (i.remarks.trim().isNotEmpty) {
+          b.writeln('     Catatan : ${i.remarks.trim()}');
+        }
+        if (i.damagePhotos.isNotEmpty) {
+          b.writeln('     Foto rusak : ${i.damagePhotos.length}');
+        }
+      }
+    }
+
+    b
+      ..writeln()
+      ..writeln(line)
+      ..write('*TOTAL: $total ban*');
+    return b.toString();
   }
 
   // Fungsi untuk mengisi data material dari API
