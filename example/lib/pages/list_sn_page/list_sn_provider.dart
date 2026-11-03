@@ -278,14 +278,6 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
       ..writeln('🔢 Total        : *$total ban*');
 
     // Rekap singkat per material, hanya kalau lebih dari satu material.
-    if (groups.length > 1) {
-      b
-        ..writeln()
-        ..writeln('*Rekap per material*');
-      for (final items in groups) {
-        b.writeln('• ${orDash(items.first.material)} → *${items.length} ban*');
-      }
-    }
 
     for (var g = 0; g < groups.length; g++) {
       final items = groups[g];
@@ -294,7 +286,6 @@ class ListSnNotifier extends StateNotifier<ListSnState> {
       b
         ..writeln()
         ..writeln(line)
-        ..writeln('*MATERIAL ${g + 1} dari ${groups.length}*')
         ..writeln('Kode       : ${orDash(first.material)}')
         ..writeln('Deskripsi  : ${orDash(first.description)}')
         ..writeln(

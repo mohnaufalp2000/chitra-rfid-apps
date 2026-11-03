@@ -176,15 +176,6 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
       ..writeln('✅ GOOD: $totalGood    ⚠️ BAD: ${total - totalGood}');
 
     // Rekap singkat per material, hanya kalau lebih dari satu material.
-    if (groups.length > 1) {
-      b
-        ..writeln()
-        ..writeln('*Rekap per material*');
-      for (final items in groups) {
-        final m = items.first.material!;
-        b.writeln('• ${orDash(m.material)} → *${items.length} ban*');
-      }
-    }
 
     for (var g = 0; g < groups.length; g++) {
       final items = groups[g];
@@ -194,7 +185,6 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
       b
         ..writeln()
         ..writeln(line)
-        ..writeln('*MATERIAL ${g + 1} dari ${groups.length}*')
         ..writeln('Kode       : ${orDash(m.material)}')
         ..writeln('Deskripsi  : ${orDash(m.description)}')
         ..writeln('Plant/SLoc : ${orDash(m.plnt)} / ${orDash(m.sloc)}')
