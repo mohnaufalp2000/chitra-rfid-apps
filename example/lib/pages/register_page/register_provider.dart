@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/legacy.dart';
+import 'package:flutter_uhf_rfid_example/services/api/damage_photo_service.dart';
 import 'package:flutter_uhf_rfid_example/services/api/material_service.dart';
 import 'package:flutter_uhf_rfid_example/services/api/rfid_service.dart';
 import 'package:flutter_uhf_rfid_example/services/api/whatsapp_service.dart';
@@ -22,6 +23,11 @@ typedef RfidRegister =
       required String createdBy,
       required RfidMovementStatus status,
     });
+typedef DamagePhotoUploader =
+    Future<List<String>> Function({
+      required String sn,
+      required List<String> paths,
+    });
 typedef WhatsappSender = Future<void> Function(String message);
 typedef SnPhotoLoader =
     Future<List<SnPhotoCapture>> Function(String materialCode);
@@ -32,11 +38,13 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
   RegisterNotifier({
     RfidLookup? lookupRfid,
     RfidRegister? registerRfid,
+    DamagePhotoUploader? uploadDamagePhotos,
     WhatsappSender? sendWhatsapp,
     SnPhotoLoader? loadSnPhotos,
     SnPhotoConverter? convertSnPhotos,
   }) : _lookupRfid = lookupRfid ?? RfidService.findByEpc,
        _registerRfid = registerRfid ?? RfidService.registerRfid,
+       _uploadDamagePhotos = uploadDamagePhotos ?? DamagePhotoService.upload,
        _sendWhatsapp = sendWhatsapp ?? WhatsappService.send,
        _loadSnPhotos = loadSnPhotos ?? SnPhotoCropService().loadForMaterial,
        _convertSnPhotos = convertSnPhotos ?? SnPhotoConversionService().convert,
@@ -48,10 +56,18 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
   final ekspedisiController = TextEditingController();
   final RfidLookup _lookupRfid;
   final RfidRegister _registerRfid;
+  final DamagePhotoUploader _uploadDamagePhotos;
+
+  /// Id foto yang sudah terupload per SN. Kalau POST /rfid gagal lalu operator
+  /// menekan simpan lagi, foto tidak diupload ulang.
+  final Map<String, List<String>> _damagePhotoIds = {};
   final WhatsappSender _sendWhatsapp;
   final SnPhotoLoader _loadSnPhotos;
   final SnPhotoConverter _convertSnPhotos;
   bool _epcCheckInProgress = false;
+
+  /// Mencegah save ganda: selama satu save berjalan, tap berikutnya diabaikan.
+  bool _isSaving = false;
 
   void selectSn(String sn) {
     state = state.copyWith(selectedSn: sn);
@@ -62,7 +78,12 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
   }
 
   // Fungsi untuk post data input barang ke One Chitra
-  Future<void> saveRegisterRfid() async {
+  /// Return true kalau data tersimpan, false kalau diabaikan karena save
+  /// sebelumnya masih berjalan (tap ganda).
+  Future<bool> saveRegisterRfid() async {
+    if (_isSaving) return false;
+    _isSaving = true;
+
     try {
       if (state.isConvertingSnPhotos) {
         throw Exception('Tunggu konversi foto SN selesai');
@@ -93,10 +114,32 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
 
       state = state.copyWith(isLoading: true, error: null);
 
+      // Upload foto kerusakan semua SN sekaligus (paralel). eagerError: begitu
+      // satu upload gagal, error langsung dilempar tanpa menunggu yang lain.
+      final needUpload = state.snList.where(
+        (item) =>
+            item.tireCondition == TireCondition.bad &&
+            item.damagePhotos.isNotEmpty &&
+            !_damagePhotoIds.containsKey(item.sn),
+      );
+
+      await Future.wait(
+        needUpload.map((item) async {
+          _damagePhotoIds[item.sn] = await _uploadDamagePhotos(
+            sn: item.sn,
+            paths: item.damagePhotos,
+          );
+        }),
+        eagerError: true,
+      );
+
       final groupedItems = <(String?, String?, String?), List<SnModel>>{};
 
       for (final item in state.snList.map(
-        (item) => item.copyWith(ekspedisi: ekspedisi),
+        (item) => item.copyWith(
+          ekspedisi: ekspedisi,
+          damagePhotoIds: _damagePhotoIds[item.sn],
+        ),
       )) {
         final material = item.material!;
         final key = (material.material, material.plnt, material.sloc);
@@ -125,8 +168,9 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         }),
       );
 
-      // Foto kerusakan tidak dikirim dan tidak disimpan: buang setelah save.
+      // Foto sudah terupload: file lokal dibuang setelah save.
       _discardDamageFiles(state.snList);
+      _damagePhotoIds.clear();
 
       snController.clear();
       ekspedisiController.clear();
@@ -136,10 +180,14 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
         clearSelectedSn: true,
         clearSelectedMaterial: true,
       );
+
+      return true;
     } catch (e) {
       state = state.copyWith(isLoading: false, error: e.toString());
 
       rethrow;
+    } finally {
+      _isSaving = false;
     }
   }
 
@@ -430,6 +478,7 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
   /// Tambah foto kerusakan (DEMO: hanya disimpan di state, tidak dikirim).
   void addDamagePhotos(String sn, List<String> paths) {
     if (paths.isEmpty) return;
+    _damagePhotoIds.remove(sn); // foto berubah: upload ulang saat save
     state = state.copyWith(
       snList: state.snList.map((item) {
         if (item.sn != sn) return item;
@@ -454,6 +503,7 @@ class RegisterNotifier extends StateNotifier<RegisterState> {
     try {
       File(path).delete().ignore();
     } catch (_) {}
+    _damagePhotoIds.remove(sn);
     state = state.copyWith(
       snList: state.snList.map((item) {
         if (item.sn != sn) return item;

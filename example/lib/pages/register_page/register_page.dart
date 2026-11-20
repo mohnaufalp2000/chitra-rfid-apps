@@ -93,6 +93,7 @@ class _RegisterPageState extends ConsumerState<RegisterPage> {
   Widget build(BuildContext context) {
     final isConnected = ref.watch(isConnectedProvider);
     final notifier = ref.read(registerProvider.notifier);
+    final isSaving = ref.watch(registerProvider.select((s) => s.isLoading));
 
     return Scaffold(
       backgroundColor: const Color(0xFFF5F7FA),
@@ -164,9 +165,13 @@ class _RegisterPageState extends ConsumerState<RegisterPage> {
       bottomNavigationBar: Padding(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         child: SaveAllButton(
+          isLoading: isSaving,
           onPressed: () async {
             try {
-              await notifier.saveRegisterRfid();
+              final saved = await notifier.saveRegisterRfid();
+
+              // Tap ganda saat save berjalan: abaikan.
+              if (!saved) return;
 
               if (!context.mounted) return;
 
@@ -184,12 +189,17 @@ class _RegisterPageState extends ConsumerState<RegisterPage> {
             } catch (e) {
               if (!context.mounted) return;
 
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(e.toString()),
-                  backgroundColor: Colors.red,
-                ),
-              );
+              // clearSnackBars: buang snackbar lama/antrean supaya error
+              // langsung tampil, tidak menunggu snackbar sebelumnya habis.
+              ScaffoldMessenger.of(context)
+                ..clearSnackBars()
+                ..showSnackBar(
+                  SnackBar(
+                    content: Text(e.toString().replaceFirst('Exception: ', '')),
+                    backgroundColor: Colors.red,
+                    duration: const Duration(seconds: 3),
+                  ),
+                );
             }
           },
         ),

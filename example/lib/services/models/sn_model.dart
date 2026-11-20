@@ -20,6 +20,10 @@ class SnModel {
   /// tidak disalin ke penyimpanan permanen.
   final List<String> damagePhotos;
 
+  /// Id foto kerusakan hasil upload (ph_001, ...). Ini yang dikirim ke server
+  /// sebagai `damage_photos`.
+  final List<String> damagePhotoIds;
+
   /// Ekspedisi pengirim ban. Diisi saat ban masuk, dan diteruskan lagi saat
   /// ban keluar. Null = tidak ikut dikirim.
   final String? ekspedisi;
@@ -39,6 +43,7 @@ class SnModel {
     this.remarks = '',
     this.photoPath,
     this.damagePhotos = const [],
+    this.damagePhotoIds = const [],
     this.ekspedisi,
     this.platTruk,
     this.tujuan,
@@ -55,6 +60,7 @@ class SnModel {
     String? remarks,
     String? photoPath,
     List<String>? damagePhotos,
+    List<String>? damagePhotoIds,
     String? ekspedisi,
     String? platTruk,
     String? tujuan,
@@ -70,6 +76,7 @@ class SnModel {
       remarks: remarks ?? this.remarks,
       photoPath: photoPath ?? this.photoPath,
       damagePhotos: damagePhotos ?? this.damagePhotos,
+      damagePhotoIds: damagePhotoIds ?? this.damagePhotoIds,
       ekspedisi: ekspedisi ?? this.ekspedisi,
       platTruk: platTruk ?? this.platTruk,
       tujuan: tujuan ?? this.tujuan,
@@ -85,6 +92,7 @@ class SnModel {
       "linked": linked,
       "tire_condition": tireCondition.name.toUpperCase(),
       "remarks": remarks.trim(),
+      if (damagePhotoIds.isNotEmpty) "damage_photos": damagePhotoIds,
       // Field pengiriman: hanya dikirim kalau diisi.
       if (ekspedisi != null) "ekspedisi": ekspedisi!.trim(),
       if (platTruk != null) "plat_truk": platTruk!.trim(),

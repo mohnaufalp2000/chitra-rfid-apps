@@ -5,7 +5,14 @@ import 'package:flutter_uhf_rfid_example/styles/font.dart';
 class SaveAllButton extends StatelessWidget {
   final VoidCallback onPressed;
 
-  const SaveAllButton({super.key, required this.onPressed});
+  /// Selama true tombol nonaktif dan menampilkan indikator loading.
+  final bool isLoading;
+
+  const SaveAllButton({
+    super.key,
+    required this.onPressed,
+    this.isLoading = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -15,12 +22,21 @@ class SaveAllButton extends StatelessWidget {
         height: 56,
         width: double.infinity,
         child: ElevatedButton.icon(
-          onPressed: onPressed,
+          onPressed: isLoading ? null : onPressed,
 
-          icon: const Icon(Icons.save_outlined, color: Colors.white),
+          icon: isLoading
+              ? const SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
+                )
+              : const Icon(Icons.save_outlined, color: Colors.white),
 
           label: Text(
-            'SAVE',
+            isLoading ? 'MENYIMPAN...' : 'SAVE',
             style: AppFont.style(
               color: Colors.white,
               weight: FontWeight.w600,
@@ -31,6 +47,7 @@ class SaveAllButton extends StatelessWidget {
           style: ElevatedButton.styleFrom(
             elevation: 0,
             backgroundColor: AppColor.primary,
+            disabledBackgroundColor: AppColor.primary.withValues(alpha: 0.6),
 
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(14),
